@@ -1,13 +1,35 @@
 package tribserver
 
 import (
+	"crypto/md5"
+	"encoding/json"
 	"errors"
-
+	"fmt"
 	"github.com/cmu440/tribbler/rpc/tribrpc"
 )
 
 type tribServer struct {
 	// TODO: implement this!
+}
+
+// hashing utility function
+func md5Hash(data []byte) string {
+	hash := md5.New()
+	hash.Write(data)
+	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+// JSON marshaling utility function
+func tribbleToJson(trib *tribrpc.Tribble) ([]byte, error) {
+	tribJson, err := json.Marshal(trib)
+	return tribJson, err
+}
+
+// JSON unmarshaling utility function
+func jsonToTribble(jsonData []byte) (*tribrpc.Tribble, error) {
+	var parsedTrib *tribrpc.Tribble
+	err := json.Unmarshal(jsonData, &parsedTrib)
+	return parsedTrib, err
 }
 
 // NewTribServer creates, starts and returns a new TribServer. masterServerHostPort
