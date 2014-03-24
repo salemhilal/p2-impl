@@ -51,7 +51,10 @@ type storageServer struct {
 	// a list of storage servers, sorted in increasing order of nodeID
 	hashRing []storagerpc.Node
 
-	// TODO: datamap type
+	// key/value storage datamap types
+	singleValueMap map[string]string
+	listValueMap   map[string]([]string)
+
 	// TODO: lease-tracking data type
 }
 
@@ -81,6 +84,32 @@ func (ss *storageServer) findPrevNextNodes(hashRing []storagerpc.Node) (*storage
 	return nil, nil, nil
 }
 
+// checks if the given key falls within this node's hash range
+// should only be called if the cluster is ready
+func (ss *storageServer) isKeyInHashRange(key string) bool {
+	if ss.numNodes <= 1 {
+		return true
+	}
+
+	prevNodeID := ss.prevNode.NodeID
+	thisNodeID := ss.thisNode.NodeID
+	if prevNodeID == thisNodeID {
+		_DEBUGLOG.Printf(
+			"nodes should have unique IDs, but %v was duplicated! hashRing %v\n",
+			thisNodeID, ss.hashRing)
+		panic("shit dude")
+	}
+
+	keyHashID := hashKeyPrefix(key)
+
+	if prevNodeID < thisNodeID {
+		return prevNodeID < keyHashID && keyHashID <= thisNodeID
+	} else {
+		// account for wraparound
+		return keyHashID > prevNodeID || keyHashID <= thisNodeID
+	}
+}
+
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
 // is the master storage server's host:port address. If empty, then this server
 // is the master; otherwise, this server is a slave. numNodes is the total number of
@@ -102,6 +131,8 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		clusterIsReady: false,
 		numNodes:       numNodes,
 		thisNode:       thisNode,
+		singleValueMap: make(map[string]string),
+		listValueMap:   make(map[string]([]string)),
 		// remember to initialize prevNode, nextNode, and hashRing later!
 		prevNode: nil,
 		nextNode: nil,
@@ -182,6 +213,9 @@ func initMasterServerHashRing(masterData *storageServer) error {
 	masterData.dataLock.Lock()
 	masterData.hashRing = hashRing
 	masterData.clusterIsReady = true
+	prevNode, nextNode, _ := masterData.findPrevNextNodes(hashRing)
+	masterData.prevNode = prevNode
+	masterData.nextNode = nextNode
 	masterData.dataLock.Unlock()
 
 	masterData.registrationResponseChan <- storagerpc.OK
@@ -263,6 +297,9 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 }
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
+	_DEBUGLOG.Println("CALL RegisterServer")
+	defer _DEBUGLOG.Println("EXIT RegisterServer")
+
 	newNode := args.ServerInfo
 
 	// wrapped into a closure to ensure lock is released after critical section
@@ -322,6 +359,9 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
+	_DEBUGLOG.Println("CALL GetServers")
+	defer _DEBUGLOG.Println("EXIT GetServers")
+
 	ss.dataLock.Lock()
 	defer ss.dataLock.Unlock()
 
@@ -336,21 +376,101 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
-	return errors.New("not implemented")
+	_DEBUGLOG.Println("CALL Get", ss.thisNode, args)
+	defer _DEBUGLOG.Println("EXIT Get")
+
+	ss.dataLock.Lock()
+	defer ss.dataLock.Unlock()
+
+	key, wantLease, hostport := args.Key, args.WantLease, args.HostPort
+	// default empty lease
+	emptyLease := storagerpc.Lease{}
+	replyLease := emptyLease
+
+	if !ss.clusterIsReady {
+		reply.Status = storagerpc.NotReady
+		reply.Value = ""
+		reply.Lease = replyLease
+		return nil
+
+		// check that the key is in the hash range
+	} else if !ss.isKeyInHashRange(key) {
+		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
+			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+		reply.Status = storagerpc.WrongServer
+		reply.Value = ""
+		reply.Lease = replyLease
+		return nil
+	}
+
+	// TODO: implement leases
+	if wantLease {
+		_ = hostport
+		_DEBUGLOG.Println("WARNING: leases not yet implemented")
+		return errors.New("leases not yet implemented")
+	}
+
+	value, keyFound := ss.singleValueMap[key]
+	if keyFound {
+		reply.Status = storagerpc.OK
+		reply.Value = value
+		reply.Lease = replyLease
+	} else {
+		reply.Status = storagerpc.KeyNotFound
+		reply.Value = ""
+		reply.Lease = replyLease
+	}
+	return nil
 }
 
 func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
+	_DEBUGLOG.Println("CALL GetList", ss.thisNode, args)
+	defer _DEBUGLOG.Println("EXIT GetList")
+
 	return errors.New("not implemented")
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	return errors.New("not implemented")
+	_DEBUGLOG.Println("CALL Put", ss.thisNode, args)
+	defer _DEBUGLOG.Println("EXIT Put")
+
+	ss.dataLock.Lock()
+	defer ss.dataLock.Unlock()
+
+	key, value := args.Key, args.Value
+	if !ss.clusterIsReady {
+		reply.Status = storagerpc.NotReady
+		return nil
+
+		// check that key is in the hash range
+	} else if !ss.isKeyInHashRange(key) {
+		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
+			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+		reply.Status = storagerpc.WrongServer
+		return nil
+	}
+
+	_, alreadyHasList := ss.listValueMap[key]
+	if alreadyHasList {
+		return errors.New(fmt.Sprintf("key %s already has list, cannot be Put", key))
+	}
+
+	ss.singleValueMap[key] = value
+	reply.Status = storagerpc.OK
+
+	return nil
 }
 
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
+	_DEBUGLOG.Println("CALL AppendToList", nodeToStr(ss.thisNode), args)
+	defer _DEBUGLOG.Println("EXIT AppendToList")
+
 	return errors.New("not implemented")
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
+	_DEBUGLOG.Println("CALL RemoveFromList", nodeToStr(ss.thisNode), args)
+	defer _DEBUGLOG.Println("EXIT RemoveFromList")
+
 	return errors.New("not implemented")
 }

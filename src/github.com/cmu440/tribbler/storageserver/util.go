@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var _DEBUGLOG = log.New(os.Stdout, "STORESRV: ", log.Lmicroseconds|log.Lshortfile)
+var _DEBUGLOG = log.New(os.Stdout, "STR: ", log.Lmicroseconds|log.Lshortfile)
 var _INIT_RETRY_INTERVAL = 1 * time.Second
 
 // Implements a sort.Interface for []storagerpc.Node based on the NodeID field, ascending.
