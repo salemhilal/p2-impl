@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-var RPC_NAME string = "StorageServer"
-
 var _DEBUGLOG = log.New(os.Stdout, "STORESRV: ", log.Lmicroseconds|log.Lshortfile)
 var _INIT_RETRY_INTERVAL = 1 * time.Second
 

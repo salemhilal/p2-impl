@@ -22,6 +22,13 @@ type storageServer struct {
 	// whether or not this server is the master server
 	isMaster bool
 
+	// if the server is the master server, this will be the channel it will
+	// receive new registrations on. If not, this will be nil
+	registrationReceiveChan chan storagerpc.Node
+	// if the server is the master server, this will be the channel it will
+	// send its the final hashring back to the RegisterServer rpc call on
+	registrationResponseChan chan storagerpc.Status
+
 	// whether or not all servers in the cluster are ready
 	clusterIsReady bool
 
@@ -31,11 +38,13 @@ type storageServer struct {
 	// the Node representing the current server
 	thisNode *storagerpc.Node
 
-	// the Node representing the server preceding this one in the hash ring
+	// the Node representing the server preceding this one in the hash ring,
+	// with wraparound
 	// (set to nil if none exists)
 	prevNode *storagerpc.Node
 
-	// the Node representing the server following this one in the hash ring
+	// the Node representing the server following this one in the hash ring,
+	// with wraparound
 	// (set to nil if none exists)
 	nextNode *storagerpc.Node
 
@@ -44,6 +53,32 @@ type storageServer struct {
 
 	// TODO: datamap type
 	// TODO: lease-tracking data type
+}
+
+// returns the nodes preceding and succeeding the given server's node in the
+// given hashRing. Returns an error if the given node is not in the hashRing.
+// Returns nil if no preceding or succeeding nodes exist
+// (due to having one node)
+func (ss *storageServer) findPrevNextNodes(hashRing []storagerpc.Node) (*storagerpc.Node, *storagerpc.Node, error) {
+	thisNodeIndex := getHashRingNodeIndex(hashRing,
+		ss.thisNode.NodeID)
+
+	if thisNodeIndex < 0 {
+		return nil, nil, errors.New(
+			fmt.Sprintf("hash ring error, node %s not found\n",
+				nodeToStr(ss.thisNode)))
+	}
+
+	// get the prevNode and nextNode references, if available
+	if ss.numNodes > 1 {
+		prevIndex := posModulo(thisNodeIndex-1, len(hashRing))
+		nextIndex := posModulo(thisNodeIndex+1, len(hashRing))
+
+		prevNode := &hashRing[prevIndex]
+		nextNode := &hashRing[nextIndex]
+		return prevNode, nextNode, nil
+	}
+	return nil, nil, nil
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -71,10 +106,18 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		prevNode: nil,
 		nextNode: nil,
 		hashRing: nil,
+
+		registrationReceiveChan:  nil,
+		registrationResponseChan: nil,
+	}
+
+	if rawServerData.isMaster {
+		rawServerData.registrationReceiveChan = make(chan storagerpc.Node)
+		rawServerData.registrationResponseChan = make(chan storagerpc.Status, 1)
 	}
 
 	// make server methods available for rpc
-	rpc.RegisterName(RPC_NAME, storagerpc.Wrap(rawServerData))
+	rpc.RegisterName("StorageServer", storagerpc.Wrap(rawServerData))
 	rpc.HandleHTTP()
 
 	listenSocket, err := net.Listen("tcp", rawServerData.thisNode.HostPort)
@@ -97,6 +140,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		_DEBUGLOG.Println(err.Error())
 		return nil, err
 	}
+	_DEBUGLOG.Println("final hash ring", rawServerData.hashRing)
 
 	return rawServerData, nil
 }
@@ -105,23 +149,48 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 func initMasterServerHashRing(masterData *storageServer) error {
 	_DEBUGLOG.Printf("initializing master %s...\n",
 		nodeToStr(masterData.thisNode))
+	defer _DEBUGLOG.Println("finished initializing master",
+		nodeToStr(masterData.thisNode))
 
-	hashRing := make([]storagerpc.Node, masterData.numNodes)
-
+	hashRing := make([]storagerpc.Node, 0)
 	// remember to add the master server to the hash ring
 	hashRing = append(hashRing, *masterData.thisNode)
 
-	// TODO: wait until all slave servers registered
-	serversSeen := 1
+	for len(hashRing) < masterData.numNodes {
+		select {
+		case newNode := <-masterData.registrationReceiveChan:
+			// make sure we don't double add the same node
+			foundNodeIndex := getHashRingNodeIndex(hashRing, newNode.NodeID)
+			if foundNodeIndex < 0 {
+				hashRing = append(hashRing, newNode)
+				_DEBUGLOG.Printf("Master received %s; updated HashRing: %v\n",
+					nodeToStr(&newNode), hashRing)
+			} else {
+				_DEBUGLOG.Printf("Master received duplicate %s; HashRing not changed: %v\n",
+					nodeToStr(&newNode), hashRing)
+			}
 
-	for serversSeen < masterData.numNodes {
-		select {} // TODO: implement!
+			if len(hashRing) < masterData.numNodes {
+				masterData.registrationResponseChan <- storagerpc.NotReady
+			}
+		}
 	}
 
 	// sort by ascending node id
 	sort.Sort(sortByNodeID(hashRing))
 
-	return errors.New("not yet implemented")
+	masterData.dataLock.Lock()
+	masterData.hashRing = hashRing
+	masterData.clusterIsReady = true
+	masterData.dataLock.Unlock()
+
+	masterData.registrationResponseChan <- storagerpc.OK
+	// close channel so that future registers don't block
+	// (ie: only send an OK response once, and let RegisterServer treat the
+	//  closed channel as a signal that the server ring is already OK)
+	close(masterData.registrationResponseChan)
+
+	return nil
 }
 
 // blocks until the slave server is ready and has received data from the master
@@ -151,7 +220,8 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 	var registerReply *storagerpc.RegisterReply
 
 	for {
-		err = masterClient.Call(fmt.Sprintf("%s.RegisterServer", RPC_NAME),
+		// call the Master server's registration rpc method
+		err = masterClient.Call(fmt.Sprintf("StorageServer.RegisterServer"),
 			registerArgs, &registerReply)
 		// handle error in call to registration
 		if err != nil {
@@ -167,25 +237,15 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 				defer slaveData.dataLock.Unlock()
 
 				hashRing := registerReply.Servers
-				slaveData.hashRing = hashRing
-
-				thisNodeIndex := getHashRingNodeIndex(hashRing,
-					slaveData.thisNode.NodeID)
-
-				if thisNodeIndex < 0 {
-					panic(fmt.Sprintf("hash ring error, slave %s not found\n",
-						nodeToStr(slaveData.thisNode)))
-				}
-
 				_DEBUGLOG.Println("received HASHRING:", hashRing)
-				// get the prevNode and nextNode references, if available
-				if slaveData.numNodes > 1 {
-					prevIndex := posModulo(thisNodeIndex-1, len(hashRing))
-					nextIndex := posModulo(thisNodeIndex+1, len(hashRing))
 
-					slaveData.prevNode = &hashRing[prevIndex]
-					slaveData.nextNode = &hashRing[nextIndex]
+				prevNode, nextNode, err := slaveData.findPrevNextNodes(hashRing)
+				if err != nil {
+					return err
 				}
+				slaveData.prevNode = prevNode
+				slaveData.nextNode = nextNode
+				slaveData.hashRing = hashRing
 
 				slaveData.clusterIsReady = true
 				_DEBUGLOG.Printf("%s registered; master ready!\n",
@@ -199,12 +259,66 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 		_DEBUGLOG.Printf("%s slave retrying register...\n", nodeToStr(slaveData.thisNode))
 		time.Sleep(_INIT_RETRY_INTERVAL)
 	}
-
-	return errors.New("not yet implemented")
+	return nil
 }
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
-	return errors.New("not implemented")
+	newNode := args.ServerInfo
+
+	// wrapped into a closure to ensure lock is released after critical section
+	err, shouldReturnEarly := func() (error, bool) {
+		ss.dataLock.Lock()
+		defer ss.dataLock.Unlock()
+
+		if !ss.isMaster {
+			return errors.New(fmt.Sprintf("cannot register to %s; "+
+				"registration not allowed on slave servers",
+				nodeToStr(ss.thisNode))), true
+		} else if ss.clusterIsReady {
+			newNodeIndex := getHashRingNodeIndex(ss.hashRing, newNode.NodeID)
+			if newNodeIndex < 0 ||
+				ss.hashRing[newNodeIndex].HostPort != newNode.HostPort {
+				// if trying to register something not already in the hashRing,
+				// return error
+				return errors.New(fmt.Sprintf("cannot register new node %s to %s; "+
+					"maximum number of servers have already been registered",
+					nodeToStr(&newNode), nodeToStr(ss.thisNode))), true
+			} else {
+				// otherwise, simply respond with OK again using the master's
+				// stored hashRing without reregistering
+				// the slave server that's already in the ring
+				reply.Status = storagerpc.OK
+				reply.Servers = ss.hashRing
+
+				_DEBUGLOG.Printf("master is already ready, sending OK to %s with %v\n",
+					nodeToStr(&newNode), reply.Servers)
+				return nil, true
+			}
+		}
+		return nil, false
+	}()
+
+	if shouldReturnEarly {
+		return err
+	}
+
+	// send the registration info to the master server and wait for a response
+	ss.registrationReceiveChan <- newNode
+	respStatus, isOpen := <-ss.registrationResponseChan
+
+	// if channel is closed, then it has already sent an OK signal in the past
+	if (!isOpen) || respStatus == storagerpc.OK {
+		finalHashRing := ss.hashRing
+
+		_DEBUGLOG.Printf("%s's registration complete; OK with %v\n", nodeToStr(&newNode), finalHashRing)
+		reply.Status = storagerpc.OK
+		reply.Servers = finalHashRing
+	} else {
+		_DEBUGLOG.Printf("%s's registration complete; not ready\n", nodeToStr(&newNode))
+		reply.Status = storagerpc.NotReady
+		reply.Servers = nil
+	}
+	return nil
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
