@@ -375,6 +375,24 @@ func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *stor
 	return nil
 }
 
+// checks that the server is both ready and correctly allows the given key
+// in its range, calling the respective given callback functions if it isn't
+// NOT THREAD SAFE; lock before calling
+func (ss *storageServer) validateServerKey(key string,
+	onNotReady func(), onWrongServer func()) bool {
+
+	if !ss.clusterIsReady {
+		onNotReady()
+		return false
+	} else if !ss.isKeyInHashRange(key) {
+		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
+			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+		onWrongServer()
+		return false
+	}
+	return true
+}
+
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
 	_DEBUGLOG.Println("CALL Get", ss.thisNode, args)
 	defer _DEBUGLOG.Println("EXIT Get")
@@ -383,27 +401,27 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	defer ss.dataLock.Unlock()
 
 	key, wantLease, hostport := args.Key, args.WantLease, args.HostPort
-	// default empty lease
+
 	emptyLease := storagerpc.Lease{}
-	replyLease := emptyLease
+	emptyValue := ""
 
-	if !ss.clusterIsReady {
+	onNotReady := func() {
 		reply.Status = storagerpc.NotReady
-		reply.Value = ""
-		reply.Lease = replyLease
-		return nil
-
-		// check that the key is in the hash range
-	} else if !ss.isKeyInHashRange(key) {
-		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
-			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+		reply.Value = emptyValue
+		reply.Lease = emptyLease
+	}
+	onWrongServer := func() {
 		reply.Status = storagerpc.WrongServer
-		reply.Value = ""
-		reply.Lease = replyLease
+		reply.Value = emptyValue
+		reply.Lease = emptyLease
+	}
+
+	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
 		return nil
 	}
 
 	// TODO: implement leases
+	replyLease := emptyLease
 	if wantLease {
 		_ = hostport
 		_DEBUGLOG.Println("WARNING: leases not yet implemented")
@@ -417,7 +435,7 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 		reply.Lease = replyLease
 	} else {
 		reply.Status = storagerpc.KeyNotFound
-		reply.Value = ""
+		reply.Value = emptyValue
 		reply.Lease = replyLease
 	}
 	return nil
@@ -427,7 +445,48 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	_DEBUGLOG.Println("CALL GetList", ss.thisNode, args)
 	defer _DEBUGLOG.Println("EXIT GetList")
 
-	return errors.New("not implemented")
+	ss.dataLock.Lock()
+	defer ss.dataLock.Unlock()
+
+	key, wantLease, hostport := args.Key, args.WantLease, args.HostPort
+	// default empty lease
+	emptyLease := storagerpc.Lease{}
+	var emptyValue []string = nil
+
+	onNotReady := func() {
+		reply.Status = storagerpc.NotReady
+		reply.Value = emptyValue
+		reply.Lease = emptyLease
+	}
+	onWrongServer := func() {
+		reply.Status = storagerpc.WrongServer
+		reply.Value = emptyValue
+		reply.Lease = emptyLease
+	}
+
+	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
+		return nil
+	}
+
+	// TODO: implement leases
+	replyLease := emptyLease
+	if wantLease {
+		_ = hostport
+		_DEBUGLOG.Println("WARNING: leases not yet implemented")
+		return errors.New("leases not yet implemented")
+	}
+
+	value, keyFound := ss.listValueMap[key]
+	if keyFound {
+		reply.Status = storagerpc.OK
+		reply.Value = value
+		reply.Lease = replyLease
+	} else {
+		reply.Status = storagerpc.KeyNotFound
+		reply.Value = emptyValue
+		reply.Lease = replyLease
+	}
+	return nil
 }
 
 func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
@@ -438,15 +497,14 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	defer ss.dataLock.Unlock()
 
 	key, value := args.Key, args.Value
-	if !ss.clusterIsReady {
+	onNotReady := func() {
 		reply.Status = storagerpc.NotReady
-		return nil
-
-		// check that key is in the hash range
-	} else if !ss.isKeyInHashRange(key) {
-		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
-			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+	}
+	onWrongServer := func() {
 		reply.Status = storagerpc.WrongServer
+	}
+
+	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
 		return nil
 	}
 
@@ -465,12 +523,92 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	_DEBUGLOG.Println("CALL AppendToList", nodeToStr(ss.thisNode), args)
 	defer _DEBUGLOG.Println("EXIT AppendToList")
 
-	return errors.New("not implemented")
+	ss.dataLock.Lock()
+	defer ss.dataLock.Unlock()
+
+	key, value := args.Key, args.Value
+
+	onNotReady := func() {
+		reply.Status = storagerpc.NotReady
+	}
+	onWrongServer := func() {
+		reply.Status = storagerpc.WrongServer
+	}
+
+	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
+		return nil
+	}
+
+	_, alreadyHasSingleton := ss.singleValueMap[key]
+	if alreadyHasSingleton {
+		return errors.New(fmt.Sprintf("key %s already has single value, cannot be AppendToList'd", key))
+	}
+
+	oldList, hasList := ss.listValueMap[key]
+	// initialize singleton list if no list has been mapped yet
+	if !hasList {
+		ss.listValueMap[key] = []string{value}
+		reply.Status = storagerpc.OK
+		return nil
+	}
+
+	// check that the value is not already in the list
+	for i := 0; i < len(oldList); i++ {
+		if oldList[i] == value {
+			reply.Status = storagerpc.ItemExists
+			return nil
+		}
+	}
+
+	// update the list
+	ss.listValueMap[key] = append(oldList, value)
+	reply.Status = storagerpc.OK
+	return nil
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
 	_DEBUGLOG.Println("CALL RemoveFromList", nodeToStr(ss.thisNode), args)
 	defer _DEBUGLOG.Println("EXIT RemoveFromList")
 
-	return errors.New("not implemented")
+	ss.dataLock.Lock()
+	defer ss.dataLock.Unlock()
+
+	key, value := args.Key, args.Value
+
+	onNotReady := func() {
+		reply.Status = storagerpc.NotReady
+	}
+	onWrongServer := func() {
+		reply.Status = storagerpc.WrongServer
+	}
+
+	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
+		return nil
+	}
+
+	_, alreadyHasSingleton := ss.singleValueMap[key]
+	if alreadyHasSingleton {
+		return errors.New(fmt.Sprintf("key %s already has single value, cannot be RemoveFromList'd", key))
+	}
+
+	oldList, hasList := ss.listValueMap[key]
+	// if no list has been mapped yet, return ItemNotFound status
+	if !hasList {
+		reply.Status = storagerpc.ItemNotFound
+		return nil
+	}
+
+	// find index of item to remove
+	for i := 0; i < len(oldList); i++ {
+		// if item is found, remove it, update storage, and return OK status
+		if oldList[i] == value {
+			ss.listValueMap[key] = append(oldList[:i], oldList[i+1:]...)
+			reply.Status = storagerpc.OK
+			return nil
+		}
+	}
+
+	// if item was never found, return ItemNotFound
+	reply.Status = storagerpc.ItemNotFound
+	return nil
 }
