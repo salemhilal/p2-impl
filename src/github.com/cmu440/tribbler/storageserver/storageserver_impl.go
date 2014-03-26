@@ -13,7 +13,22 @@ import (
 	"time"
 )
 
+type leaseHolderInfo struct {
+	key          string
+	hostport     string
+	expireSignal chan struct{}
+}
+
+func newLeaseHolderInfo(key string, hostport string) *leaseHolderInfo {
+	return &leaseHolderInfo{
+		key:          key,
+		hostport:     hostport,
+		expireSignal: make(chan struct{}, 1),
+	}
+}
+
 type storageServer struct {
+	// use this lock whenever any part of this struct needs to be read or modified
 	dataLock *sync.Mutex
 
 	// the hostport of the master server in the cluster
@@ -55,7 +70,14 @@ type storageServer struct {
 	singleValueMap map[string]string
 	listValueMap   map[string]([]string)
 
-	// TODO: lease-tracking data type
+	// lease-tracking data types
+
+	// locks to use for blocking leasing on specific keys
+	keyPermissionLocks map[string](*sync.Mutex)
+	// a map of keys mapped to a map of all hostports
+	// that have active leases on the key. hostports are mapped to info
+	// regarding their holding status
+	leaseHolders map[string](map[string](*leaseHolderInfo))
 }
 
 // returns the nodes preceding and succeeding the given server's node in the
@@ -94,10 +116,9 @@ func (ss *storageServer) isKeyInHashRange(key string) bool {
 	prevNodeID := ss.prevNode.NodeID
 	thisNodeID := ss.thisNode.NodeID
 	if prevNodeID == thisNodeID {
-		_DEBUGLOG.Printf(
-			"nodes should have unique IDs, but %v was duplicated! hashRing %v\n",
+		_DEBUGLOG.Fatalln(
+			"nodes should have unique IDs, but %v was duplicated! invalid hashRing %v\n",
 			thisNodeID, ss.hashRing)
-		panic("shit dude")
 	}
 
 	keyHashID := hashKeyPrefix(key)
@@ -125,14 +146,16 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	}
 
 	rawServerData := &storageServer{
-		dataLock:       new(sync.Mutex),
-		masterHostport: masterServerHostPort,
-		isMaster:       (len(masterServerHostPort) == 0),
-		clusterIsReady: false,
-		numNodes:       numNodes,
-		thisNode:       thisNode,
-		singleValueMap: make(map[string]string),
-		listValueMap:   make(map[string]([]string)),
+		dataLock:           new(sync.Mutex),
+		masterHostport:     masterServerHostPort,
+		isMaster:           (len(masterServerHostPort) == 0),
+		clusterIsReady:     false,
+		numNodes:           numNodes,
+		thisNode:           thisNode,
+		singleValueMap:     make(map[string]string),
+		listValueMap:       make(map[string]([]string)),
+		keyPermissionLocks: make(map[string](*sync.Mutex)),
+		leaseHolders:       make(map[string](map[string](*leaseHolderInfo))),
 		// remember to initialize prevNode, nextNode, and hashRing later!
 		prevNode: nil,
 		nextNode: nil,
@@ -236,7 +259,7 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 	var err error
 
 	for {
-		masterClient, err = rpc.DialHTTP("tcp", slaveData.masterHostport)
+		masterClient, err = dialRpcHostport(slaveData.masterHostport)
 		if err != nil {
 			errMsg := fmt.Sprintf("slave %s dial master error: %s",
 				nodeToStr(slaveData.thisNode), err.Error())
@@ -255,7 +278,7 @@ func initSlaveServerHashRing(slaveData *storageServer) error {
 
 	for {
 		// call the Master server's registration rpc method
-		err = masterClient.Call(fmt.Sprintf("StorageServer.RegisterServer"),
+		err = masterClient.Call("StorageServer.RegisterServer",
 			registerArgs, &registerReply)
 		// handle error in call to registration
 		if err != nil {
@@ -393,12 +416,60 @@ func (ss *storageServer) validateServerKey(key string,
 	return true
 }
 
-func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
-	_DEBUGLOG.Println("CALL Get", ss.thisNode, args)
-	defer _DEBUGLOG.Println("EXIT Get")
+// NOT THREAD SAFE, make sure to lock dataLock before calling
+func (ss *storageServer) deleteCachedLease(key string, hostport string) {
+	_DEBUGLOG.Println("DELETING cached lease for", key, hostport)
+	defer _DEBUGLOG.Println("DELETED cached lease for", key, hostport)
 
-	ss.dataLock.Lock()
-	defer ss.dataLock.Unlock()
+	_, exists := ss.leaseHolders[key][hostport]
+	if exists {
+		delete(ss.leaseHolders[key], hostport)
+	}
+}
+
+// does not remove the lease from the cache, make sure to call deleteCachedLease afterwards
+func revokeLease(key string, hostport string, revokeSuccessSignal chan<- struct{}) (*storagerpc.RevokeLeaseReply, error) {
+	_DEBUGLOG.Println("REVOKING lease for", key, hostport)
+	defer _DEBUGLOG.Println("REVOKED lease for", key, hostport)
+
+	defer func() {
+		revokeSuccessSignal <- struct{}{}
+	}()
+
+	args := &storagerpc.RevokeLeaseArgs{
+		Key: key,
+	}
+	var reply storagerpc.RevokeLeaseReply
+
+	libStoreClient, err := dialRpcHostport(hostport)
+	if err == nil {
+		err = libStoreClient.Call("LeaseCallbacks.RevokeLease",
+			args, &reply)
+	}
+
+	return &reply, err
+}
+
+func (ss *storageServer) setupExpireTimeout(leaseHolder *leaseHolderInfo) {
+	startTime := time.Now().Unix()
+	_DEBUGLOG.Println("timer started on", leaseHolder, startTime)
+
+	select {
+	// if the lease expires, mark as dead, but dont revoke it
+	case <-time.After(_LEASE_EXPIRE_DURATION):
+		_DEBUGLOG.Println("EXPIRE on", leaseHolder, startTime)
+
+		// on expiration, simply expire the lease rather than revoking it
+		// explicitly
+		ss.dataLock.Lock()
+		leaseHolder.expireSignal <- struct{}{}
+		ss.dataLock.Unlock()
+	}
+}
+
+func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
+	_DEBUGLOG.Println("CALL Get", args)
+	defer _DEBUGLOG.Println("EXIT Get", args)
 
 	key, wantLease, hostport := args.Key, args.WantLease, args.HostPort
 
@@ -416,34 +487,177 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 		reply.Lease = emptyLease
 	}
 
-	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
+	ss.dataLock.Lock()
+	keyValidates := ss.validateServerKey(key, onNotReady, onWrongServer)
+	if !keyValidates {
+		ss.dataLock.Unlock()
 		return nil
 	}
 
-	// TODO: implement leases
+	keyLock, lockExists := ss.keyPermissionLocks[key]
+	ss.dataLock.Unlock()
+
+	// lock the key outside of the data lock so that other modifications
+	// to the key's lease status do not occur concurrently, while still allowing
+	// other keys to be modified
+	if lockExists {
+		_LOCKLOG.Printf("Get keylock LOCK_TRY '%s' %p\n", key, keyLock)
+		keyLock.Lock()
+		_LOCKLOG.Printf("Get keylock LOCK_SUCCESS '%s' %p\n", key, keyLock)
+	}
+	ss.dataLock.Lock()
+	// actually access the key's value data
+	value, keyFound := ss.singleValueMap[key]
+
+	// initialize/refresh lease
 	replyLease := emptyLease
-	if wantLease {
-		_ = hostport
-		_DEBUGLOG.Println("WARNING: leases not yet implemented")
-		return errors.New("leases not yet implemented")
+	// only allow leases if not about to return a KeyNotFound status
+	if wantLease && keyFound {
+		replyLease = *makeLease()
+		leaseHolder, alreadyHeld := ss.leaseHolders[key][hostport]
+		if alreadyHeld {
+			_DEBUGLOG.Printf("EXISTS lease for '%s'@%s; do not refresh\n", key, hostport)
+		} else {
+			_DEBUGLOG.Printf("INIT lease for '%s'@%s\n", key, hostport)
+			leaseHolder = newLeaseHolderInfo(key, hostport)
+			// add the hostport along with info regarding its holding status
+			ss.leaseHolders[key][hostport] = leaseHolder
+
+			// set up timeout check
+			go ss.setupExpireTimeout(leaseHolder)
+		}
 	}
 
-	value, keyFound := ss.singleValueMap[key]
-	if keyFound {
+	// set up the final reply
+	if !keyFound {
+		reply.Status = storagerpc.KeyNotFound
+		reply.Value = emptyValue
+		reply.Lease = emptyLease
+	} else {
 		reply.Status = storagerpc.OK
 		reply.Value = value
 		reply.Lease = replyLease
-	} else {
-		reply.Status = storagerpc.KeyNotFound
-		reply.Value = emptyValue
-		reply.Lease = replyLease
+	}
+
+	ss.dataLock.Unlock()
+	if lockExists {
+		_LOCKLOG.Printf("Get keylock UNLOCK_TRY '%s' %p\n", key, keyLock)
+		keyLock.Unlock()
+		_LOCKLOG.Printf("Get keylock UNLOCK_SUCCESS '%s' %p\n", key, keyLock)
 	}
 	return nil
 }
 
+func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
+	_DEBUGLOG.Println("CALL Put", args)
+	defer _DEBUGLOG.Println("EXIT Put", args)
+
+	key, value := args.Key, args.Value
+
+	// do some validation sanity checks and return early if any fail
+	err, shouldReturnEarly := func() (error, bool) {
+		ss.dataLock.Lock()
+		defer ss.dataLock.Unlock()
+
+		onNotReady := func() {
+			reply.Status = storagerpc.NotReady
+		}
+		onWrongServer := func() {
+			reply.Status = storagerpc.WrongServer
+		}
+		if !ss.validateServerKey(key, onNotReady, onWrongServer) {
+			return nil, true
+		}
+		_, alreadyHasList := ss.listValueMap[key]
+		if alreadyHasList {
+			return errors.New(fmt.Sprintf("key %s already has list, cannot be Put", key)), true
+		}
+		return nil, false
+	}()
+	if shouldReturnEarly {
+		return err
+	}
+
+	// grab the permission lock on the key, if one exists
+	ss.dataLock.Lock()
+	keyLock, lockExists := ss.keyPermissionLocks[key]
+	// initialize key permission lock info without releasing the datalock so
+	// that if this block runs concurrently with itself, only one actually
+	// initializes the new key lock
+	if !lockExists {
+		keyLock = new(sync.Mutex)
+		_LOCKLOG.Printf("Put creates new keylock for %s: %p\n", key, keyLock)
+		ss.keyPermissionLocks[key] = keyLock
+		ss.leaseHolders[key] = make(map[string](*leaseHolderInfo))
+	}
+	ss.dataLock.Unlock()
+
+	_LOCKLOG.Printf("Put keylock LOCK_TRY '%s' %p\n", key, keyLock)
+	keyLock.Lock()
+	_LOCKLOG.Printf("Put keylock LOCK_SUCCESS '%s' %p\n", key, keyLock)
+
+	// revoke all existing leases
+	if lockExists {
+		ss.dataLock.Lock()
+		// store leases in this slice so we still have access after unlocking
+		leasesToRevoke := make([](*leaseHolderInfo), 0)
+		for hostport, leaseInfo := range ss.leaseHolders[key] {
+			select {
+			// don't add to revoke list if already expired
+			case <-leaseInfo.expireSignal:
+				continue
+			default:
+				leasesToRevoke = append(leasesToRevoke, leaseInfo)
+			}
+			// remove the lease from the cache
+			ss.deleteCachedLease(key, hostport)
+		}
+		// release the data lock so we are not blocking other keys
+		ss.dataLock.Unlock()
+
+		// revoke all leases in parallel
+		totalToRevoke := len(leasesToRevoke)
+		leaseDoneChan := make(chan struct{})
+		_DEBUGLOG.Println("leases to revoke:", leasesToRevoke)
+		for _, lease := range leasesToRevoke {
+			go func(lease *leaseHolderInfo) {
+				revokeSuccessSignal := make(chan struct{}, 1)
+
+				go revokeLease(lease.key, lease.hostport, revokeSuccessSignal)
+				// wait until either the lease has been revoked or the lease
+				// has expired
+				select {
+				case <-revokeSuccessSignal:
+					// pass
+				case <-lease.expireSignal:
+					// pass
+				}
+
+				leaseDoneChan <- struct{}{}
+			}(lease)
+		}
+
+		// block until all revocations are complete
+		for step := 0; step < totalToRevoke; step++ {
+			<-leaseDoneChan
+		}
+	}
+
+	ss.dataLock.Lock()
+	// actually put the value in the map
+	ss.singleValueMap[key] = value
+	reply.Status = storagerpc.OK
+
+	ss.dataLock.Unlock()
+	_LOCKLOG.Printf("Put keylock UNLOCK_TRY '%s' %p\n", key, keyLock)
+	keyLock.Unlock()
+	_LOCKLOG.Printf("Put keylock UNLOCK_SUCCESS '%s' %p\n", key, keyLock)
+	return nil
+}
+
 func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.GetListReply) error {
-	_DEBUGLOG.Println("CALL GetList", ss.thisNode, args)
-	defer _DEBUGLOG.Println("EXIT GetList")
+	_DEBUGLOG.Println("CALL GetList", args)
+	defer _DEBUGLOG.Println("EXIT GetList", args)
 
 	ss.dataLock.Lock()
 	defer ss.dataLock.Unlock()
@@ -472,8 +686,8 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	replyLease := emptyLease
 	if wantLease {
 		_ = hostport
-		_DEBUGLOG.Println("WARNING: leases not yet implemented")
-		return errors.New("leases not yet implemented")
+		_DEBUGLOG.Println("WARNING: GetList leases not yet implemented")
+		return errors.New("GetList leases not yet implemented")
 	}
 
 	value, keyFound := ss.listValueMap[key]
@@ -489,39 +703,11 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	return nil
 }
 
-func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	_DEBUGLOG.Println("CALL Put", ss.thisNode, args)
-	defer _DEBUGLOG.Println("EXIT Put")
-
-	ss.dataLock.Lock()
-	defer ss.dataLock.Unlock()
-
-	key, value := args.Key, args.Value
-	onNotReady := func() {
-		reply.Status = storagerpc.NotReady
-	}
-	onWrongServer := func() {
-		reply.Status = storagerpc.WrongServer
-	}
-
-	if !ss.validateServerKey(key, onNotReady, onWrongServer) {
-		return nil
-	}
-
-	_, alreadyHasList := ss.listValueMap[key]
-	if alreadyHasList {
-		return errors.New(fmt.Sprintf("key %s already has list, cannot be Put", key))
-	}
-
-	ss.singleValueMap[key] = value
-	reply.Status = storagerpc.OK
-
-	return nil
-}
-
 func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	_DEBUGLOG.Println("CALL AppendToList", nodeToStr(ss.thisNode), args)
-	defer _DEBUGLOG.Println("EXIT AppendToList")
+	// TODO: add lease revokation behavior
+
+	_DEBUGLOG.Println("CALL AppendToList", args)
+	defer _DEBUGLOG.Println("EXIT AppendToList", args)
 
 	ss.dataLock.Lock()
 	defer ss.dataLock.Unlock()
@@ -567,8 +753,10 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 }
 
 func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storagerpc.PutReply) error {
-	_DEBUGLOG.Println("CALL RemoveFromList", nodeToStr(ss.thisNode), args)
-	defer _DEBUGLOG.Println("EXIT RemoveFromList")
+	// TODO: add lease revokation behavior
+
+	_DEBUGLOG.Println("CALL RemoveFromList", args)
+	defer _DEBUGLOG.Println("EXIT RemoveFromList", args)
 
 	ss.dataLock.Lock()
 	defer ss.dataLock.Unlock()

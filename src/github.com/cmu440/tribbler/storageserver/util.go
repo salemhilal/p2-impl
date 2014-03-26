@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"github.com/cmu440/tribbler/libstore"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"io/ioutil"
 	"log"
+	"net/rpc"
 	"os"
 	"sort"
 	"strings"
@@ -14,7 +16,10 @@ import (
 )
 
 var _DEBUGLOG = log.New(os.Stdout, "STR: ", log.Lmicroseconds|log.Lshortfile)
+var _LOCKLOG = log.New(ioutil.Discard, "LCK: ", log.Lmicroseconds|log.Lshortfile)
 var _INIT_RETRY_INTERVAL = 1 * time.Second
+var _LEASE_EXPIRE_DURATION = (storagerpc.LeaseSeconds +
+	storagerpc.LeaseGuardSeconds) * time.Second
 
 // Implements a sort.Interface for []storagerpc.Node based on the NodeID field, ascending.
 // Modified from http://golang.org/pkg/sort/#Sort example.
@@ -24,6 +29,13 @@ type sortByNodeID []storagerpc.Node
 func (a sortByNodeID) Len() int           { return len(a) }
 func (a sortByNodeID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a sortByNodeID) Less(i, j int) bool { return a[i].NodeID < a[j].NodeID }
+
+func makeLease() *storagerpc.Lease {
+	return &storagerpc.Lease{
+		Granted:      true,
+		ValidSeconds: storagerpc.LeaseSeconds,
+	}
+}
 
 // converts a Node into a human readable string for debugging
 func nodeToStr(node *storagerpc.Node) string {
@@ -61,4 +73,8 @@ func hashKeyPrefix(key string) uint32 {
 
 	prefix := strings.SplitN(key, sep, numSubstrs)[0]
 	return libstore.StoreHash(prefix)
+}
+
+func dialRpcHostport(hostport string) (*rpc.Client, error) {
+	return rpc.DialHTTP("tcp", hostport)
 }
