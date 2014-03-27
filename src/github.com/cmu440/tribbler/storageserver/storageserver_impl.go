@@ -23,7 +23,7 @@ func newLeaseHolderInfo(key string, hostport string) *leaseHolderInfo {
 	return &leaseHolderInfo{
 		key:          key,
 		hostport:     hostport,
-		expireSignal: make(chan struct{}, 1),
+		expireSignal: make(chan struct{}),
 	}
 }
 
@@ -462,7 +462,7 @@ func (ss *storageServer) setupExpireTimeout(leaseHolder *leaseHolderInfo) {
 		// on expiration, simply expire the lease rather than revoking it
 		// explicitly
 		ss.dataLock.Lock()
-		leaseHolder.expireSignal <- struct{}{}
+		close(leaseHolder.expireSignal)
 		ss.dataLock.Unlock()
 	}
 }
