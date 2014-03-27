@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -30,22 +29,17 @@ var (
 )
 
 var (
-	output     io.Writer
 	pc         proxycounter.ProxyCounter
 	ls         libstore.Libstore
 	revokeConn *rpc.Client
 	passCount  int
 	failCount  int
-	LOGE       *log.Logger
 )
 
-func init() {
-	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
-	LOGE = log.New(os.Stderr, "", log.Lshortfile|log.Lmicroseconds)
-}
+var LOGE = log.New(os.Stderr, "", log.Lshortfile|log.Lmicroseconds)
 
 // Initialize proxy and libstore
-func initLibstore(storage string, server string, myhostport string, alwaysLease bool) (net.Listener, error) {
+func initLibstore(storage, server, myhostport string, alwaysLease bool) (net.Listener, error) {
 	l, err := net.Listen("tcp", server)
 	if err != nil {
 		LOGE.Println("Failed to listen:", err)
@@ -154,7 +148,7 @@ func checkError(err error, expectError bool) bool {
 		}
 	} else {
 		if err != nil {
-			LOGE.Println("FAIL: unexpected error returned")
+			LOGE.Println("FAIL: unexpected error returned:", err)
 			failCount++
 			return true
 		}
@@ -165,10 +159,10 @@ func checkError(err error, expectError bool) bool {
 // Test libstore returns nil when it cannot connect to the server
 func testNonexistentServer() {
 	if l, err := libstore.NewLibstore(fmt.Sprintf("localhost:%d", *portnum), fmt.Sprintf("localhost:%d", *portnum), libstore.Normal); l == nil || err != nil {
-		fmt.Fprintln(output, "PASS")
+		fmt.Println("PASS")
 		passCount++
 	} else {
-		LOGE.Println("FAIL: libstore does not return nil when it cannot connect to nonexistent storage server")
+		LOGE.Println("FAIL: libstore does not return a non-nil error when it cannot connect to nonexistent storage server")
 		failCount++
 	}
 	cleanupLibstore(nil)
@@ -190,7 +184,7 @@ func testNoLeases() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -211,7 +205,7 @@ func testAlwaysLeases() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -227,7 +221,7 @@ func testGetError() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -243,7 +237,7 @@ func testGetErrorStatus() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -263,7 +257,7 @@ func testGetValid() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -279,7 +273,7 @@ func testPutError() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -295,7 +289,7 @@ func testPutErrorStatus() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -318,7 +312,7 @@ func testPutValid() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -334,7 +328,7 @@ func testGetListError() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -350,7 +344,7 @@ func testGetListErrorStatus() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -370,7 +364,7 @@ func testGetListValid() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -386,7 +380,7 @@ func testAppendToListError() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -402,7 +396,7 @@ func testAppendToListErrorStatus() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -425,7 +419,7 @@ func testAppendToListValid() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -441,7 +435,7 @@ func testRemoveFromListError() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -457,7 +451,7 @@ func testRemoveFromListErrorStatus() {
 	if checkLimits(5, 50) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -488,7 +482,7 @@ func testRemoveFromListValid() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -504,7 +498,7 @@ func testCacheGetLimit() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -517,7 +511,7 @@ func testCacheGetLimit2() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -541,7 +535,7 @@ func testCacheGetCorrect() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -565,7 +559,7 @@ func testCacheGetLeaseNotGranted() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -581,7 +575,7 @@ func testCacheGetLeaseNotGranted2() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -606,7 +600,7 @@ func testCacheGetLeaseTimeout() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -666,7 +660,7 @@ func testCacheGetMemoryLeak() {
 	// of this test until now (currently 5,000,000).
 	const maxBytes = 5000000
 	if finalAlloc < initAlloc || (finalAlloc-initAlloc) < maxBytes {
-		fmt.Fprintln(output, "PASS")
+		fmt.Println("PASS")
 		passCount++
 	} else {
 		LOGE.Printf("FAIL: Libstore not cleaning expired/cached data (bytes still in use: %d, max allowed: %d)\n",
@@ -702,7 +696,7 @@ func testRevokeGetValid() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -726,7 +720,7 @@ func testRevokeGetNonexistent() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -755,7 +749,7 @@ func testRevokeGetUpdate() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -771,7 +765,7 @@ func testCacheGetListLimit() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -784,7 +778,7 @@ func testCacheGetListLimit2() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -808,7 +802,7 @@ func testCacheGetListCorrect() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -832,7 +826,7 @@ func testCacheGetListLeaseNotGranted() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -848,7 +842,7 @@ func testCacheGetListLeaseNotGranted2() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -873,7 +867,7 @@ func testCacheGetListLeaseTimeout() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -934,7 +928,7 @@ func testCacheGetListMemoryLeak() {
 	// of this test until now (currently 5,000,000).
 	const maxBytes = 5000000
 	if finalAlloc < initAlloc || (finalAlloc-initAlloc) < maxBytes {
-		fmt.Fprintln(output, "PASS")
+		fmt.Println("PASS")
 		passCount++
 	} else {
 		LOGE.Printf("FAIL: Libstore not cleaning expired/cached data (bytes still in use: %d, max allowed: %d)\n",
@@ -970,7 +964,7 @@ func testRevokeGetListValid() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -994,7 +988,7 @@ func testRevokeGetListNonexistent() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1024,15 +1018,11 @@ func testRevokeGetListUpdate() {
 		failCount++
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
 func main() {
-	var err error
-	output = os.Stderr
-	passCount = 0
-	failCount = 0
 	initTests := []testFunc{
 		{"testNonexistentServer", testNonexistentServer},
 		{"testNoLeases", testNoLeases},
@@ -1081,15 +1071,14 @@ func main() {
 		LOGE.Fatalln("Usage: libtest <storage master host:port>")
 	}
 
+	var err error
+
 	// Run init tests
 	for _, t := range initTests {
 		if b, err := regexp.MatchString(*testRegex, t.name); b && err == nil {
 			fmt.Printf("Running %s:\n", t.name)
 			t.f()
 		}
-		// Give the current Listener some time to close before creating
-		// a new Libstore.
-		time.Sleep(time.Duration(500) * time.Millisecond)
 	}
 
 	_, err = initLibstore(flag.Arg(0), fmt.Sprintf("localhost:%d", *portnum), fmt.Sprintf("localhost:%d", *portnum), false)

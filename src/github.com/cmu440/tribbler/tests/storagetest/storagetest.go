@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -35,16 +34,21 @@ var (
 	numServer = flag.Int("N", 1, "(jtest only) total # of storage servers")
 	myID      = flag.Int("id", 1, "(jtest only) my id")
 	testRegex = flag.String("t", "", "test to run")
-	output    io.Writer
 	passCount int
 	failCount int
 	st        *storageTester
-	LOGE      *log.Logger
 )
 
-func init() {
-	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
-	LOGE = log.New(os.Stderr, "", log.Lshortfile|log.Lmicroseconds)
+var LOGE = log.New(os.Stderr, "", log.Lshortfile|log.Lmicroseconds)
+
+var statusMap = map[storagerpc.Status]string{
+	storagerpc.OK:           "OK",
+	storagerpc.KeyNotFound:  "KeyNotFound",
+	storagerpc.ItemNotFound: "ItemNotFound",
+	storagerpc.WrongServer:  "WrongServer",
+	storagerpc.ItemExists:   "ItemExists",
+	storagerpc.NotReady:     "NotReady",
+	0:                       "Unknown",
 }
 
 func initStorageTester(server, myhostport string) (*storageTester, error) {
@@ -141,12 +145,12 @@ func (st *storageTester) AppendToList(key, newitem string) (*storagerpc.PutReply
 // Check error and status
 func checkErrorStatus(err error, status, expectedStatus storagerpc.Status) bool {
 	if err != nil {
-		LOGE.Println("FAIL: unexpected error returned")
+		LOGE.Println("FAIL: unexpected error returned:", err)
 		failCount++
 		return true
 	}
 	if status != expectedStatus {
-		LOGE.Printf("FAIL: incorrect status %d, expected status %d\n", status, expectedStatus)
+		LOGE.Printf("FAIL: incorrect status %s, expected status %s\n", statusMap[status], statusMap[expectedStatus])
 		failCount++
 		return true
 	}
@@ -157,13 +161,13 @@ func checkErrorStatus(err error, status, expectedStatus storagerpc.Status) bool 
 func checkError(err error, expectError bool) bool {
 	if expectError {
 		if err == nil {
-			LOGE.Println("FAIL: error should be returned")
+			LOGE.Println("FAIL: non-nil error should be returned")
 			failCount++
 			return true
 		}
 	} else {
 		if err != nil {
-			LOGE.Printf("FAIL: unexpected error returned (%s)\n", err)
+			LOGE.Println("FAIL: unexpected error returned:", err)
 			failCount++
 			return true
 		}
@@ -249,7 +253,7 @@ func testInitStorageServers() {
 		return
 	}
 	if replyGS.Status == storagerpc.OK {
-		LOGE.Println("FAIL: storage system should not be ready", err)
+		LOGE.Println("FAIL: storage system should not be ready:", err)
 		failCount++
 		return
 	}
@@ -260,12 +264,12 @@ func testInitStorageServers() {
 		return
 	}
 	if replyR.Status != storagerpc.OK || replyR.Servers == nil {
-		LOGE.Println("FAIL: storage system should be ready and Servers field should be non-nil", err)
+		LOGE.Println("FAIL: storage system should be ready and Servers field should be non-nil:", err)
 		failCount++
 		return
 	}
 	if len(replyR.Servers) != (*numServer) {
-		LOGE.Println("FAIL: storage system returned wrong server list", err)
+		LOGE.Println("FAIL: storage system returned wrong server list:", err)
 		failCount++
 		return
 	}
@@ -275,7 +279,7 @@ func testInitStorageServers() {
 	if checkErrorStatus(err, replyG.Status, storagerpc.WrongServer) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -328,7 +332,7 @@ func testPutGet() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -386,7 +390,7 @@ func testAppendGetRemoveList() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -427,7 +431,7 @@ func testUpdateWithoutLease() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -464,7 +468,7 @@ func testUpdateBeforeLeaseExpire() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -504,7 +508,7 @@ func testUpdateAfterLeaseExpire() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -602,7 +606,7 @@ func testDelayedRevokeWithoutBlocking() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -644,7 +648,7 @@ func testDelayedRevokeWithLeaseRequest1() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -688,7 +692,7 @@ func testDelayedRevokeWithLeaseRequest2() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -729,7 +733,7 @@ func testDelayedRevokeWithUpdate1() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -777,7 +781,7 @@ func testDelayedRevokeWithUpdate2() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -827,7 +831,7 @@ func testDelayedRevokeWithUpdate3() {
 	if delayedRevoke(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -868,7 +872,7 @@ func testUpdateListWithoutLease() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -909,7 +913,7 @@ func testUpdateListBeforeLeaseExpire() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -953,7 +957,7 @@ func testUpdateListAfterLeaseExpire() {
 		return
 	}
 
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1051,7 +1055,7 @@ func testDelayedRevokeListWithoutBlocking() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1096,7 +1100,7 @@ func testDelayedRevokeListWithLeaseRequest1() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1143,7 +1147,7 @@ func testDelayedRevokeListWithLeaseRequest2() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1182,7 +1186,7 @@ func testDelayedRevokeListWithUpdate1() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1228,7 +1232,7 @@ func testDelayedRevokeListWithUpdate2() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
@@ -1276,15 +1280,11 @@ func testDelayedRevokeListWithUpdate3() {
 	if delayedRevokeList(key1, f) {
 		return
 	}
-	fmt.Fprintln(output, "PASS")
+	fmt.Println("PASS")
 	passCount++
 }
 
 func main() {
-	output = os.Stderr
-	passCount = 0
-	failCount = 0
-
 	jtests := []testFunc{{"testInitStorageServers", testInitStorageServers}}
 	btests := []testFunc{
 		{"testPutGet", testPutGet},
@@ -1311,17 +1311,16 @@ func main() {
 
 	flag.Parse()
 	if flag.NArg() < 1 {
-		log.Fatalln("Usage: storagetest <storage master>")
+		LOGE.Fatalln("Usage: storagetest <storage master>")
 	}
 
 	// Run the tests with a single tester
 	storageTester, err := initStorageTester(flag.Arg(0), fmt.Sprintf("localhost:%d", *portnum))
 	if err != nil {
-		log.Fatalln("Failed to initialize test:", err)
+		LOGE.Fatalln("Failed to initialize test:", err)
 	}
 	st = storageTester
 
-	// Run btests
 	switch *testType {
 	case 1:
 		for _, t := range jtests {
