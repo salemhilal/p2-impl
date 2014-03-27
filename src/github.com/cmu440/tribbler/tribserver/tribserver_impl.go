@@ -61,6 +61,11 @@ func (ts *tribServer) doesUserExist(userId string) bool {
 	return existsErr == nil
 }
 
+func (ts *tribServer) initUser(userId string) {
+	userExistsKey := generateUserExistsKey(userId)
+	ts.myLibstore.Put(userExistsKey, "")
+}
+
 func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.CreateUserReply) error {
 	_DEBUGLOG.Println("CALL CreateUser", args)
 	defer _DEBUGLOG.Println("EXIT CreateUser", args, reply)
@@ -71,21 +76,19 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 	userId := args.UserID
 
 	userExistsKey := generateUserExistsKey(userId)
-	userAllTribsListKey := generateUserAllTribsListKey(userId)
-	userRecentTribsListKey := generateUserRecentTribsListKey(userId)
-	userSubsListKey := generateUserSubsKey(userId)
 
 	// check to see if the user exists
 	if !ts.doesUserExist(userId) {
 		reply.Status = tribrpc.Exists
 	} else {
 		// initialize user data with empty string to mark as existing
-		ts.myLibstore.Put(userExistsKey, "")
-		// use empty list to initialize keys that require lists
-		// REMEMBER TO FILTER OUT THE SINGLETON EMPTY STRINGS LATER
-		ts.myLibstore.AppendToList(userAllTribsListKey, "")
-		ts.myLibstore.AppendToList(userRecentTribsListKey, "")
-		ts.myLibstore.AppendToList(userSubsListKey, "")
+		ts.initUser(userId)
+
+		// note that we don't initialize the various lists for user data, since
+		// we don't have any initial data to put in them. Make sure to
+		// account for possibly missing lists when writing the other tribserver
+		// methods!
+
 		reply.Status = tribrpc.OK
 	}
 	return nil
@@ -109,8 +112,13 @@ func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tri
 	} else {
 		// actually add the target to the user's subs list
 		userSubsListKey := generateUserSubsKey(userId)
-		ts.myLibstore.AppendToList(userSubsListKey, targetId)
-		reply.Status = tribrpc.OK
+		appendError := ts.myLibstore.AppendToList(userSubsListKey, targetId)
+		if appendError != nil {
+			// don't allow duplicate subscriptions
+			reply.Status = tribrpc.Exists
+		} else {
+			reply.Status = tribrpc.OK
+		}
 	}
 	return nil
 }
@@ -133,8 +141,14 @@ func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *
 	} else {
 		// actually remove the target from the user's subs list
 		userSubsListKey := generateUserSubsKey(userId)
-		ts.myLibstore.RemoveFromList(userSubsListKey, targetId)
-		reply.Status = tribrpc.OK
+		removeErr := ts.myLibstore.RemoveFromList(userSubsListKey, targetId)
+		// don't allow removal of a user that is not actually already in the
+		// subs list (also catches case when user has no subs)
+		if removeErr != nil {
+			reply.Status = tribrpc.NoSuchTargetUser
+		} else {
+			reply.Status = tribrpc.OK
+		}
 	}
 	return nil
 }
@@ -155,13 +169,15 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 	} else {
 		userSubsListKey := generateUserSubsKey(userId)
 		subsList, err := ts.myLibstore.GetList(userSubsListKey)
+		// if no subs list exists, but the actual user exists, this just means
+		// that we haven't initialized the actual subs list for the user, so
+		// return an empty list
 		if err != nil {
-			reply.Status = tribrpc.NoSuchUser
-			reply.UserIDs = nil
-			return err
+			reply.Status = tribrpc.OK
+			reply.UserIDs = make([]string, 0)
 		} else {
 			reply.Status = tribrpc.OK
-			reply.UserIDs = filterOutEmptyStrs(subsList)
+			reply.UserIDs = subsList
 		}
 	}
 	return nil
@@ -174,7 +190,49 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	ts.serverLock.Lock()
 	defer ts.serverLock.Unlock()
 
-	return errors.New("not implemented")
+	userId, contents := args.UserID, args.Contents
+	if !ts.doesUserExist(userId) {
+		reply.Status = tribrpc.NoSuchUser
+		return nil
+	}
+
+	// setup keys and values to be used in storage server updates
+	allTribKeylistKey := generateUserAllTribKeysListKey(userId)
+	recentTribKeylistKey := generateUserRecentTribKeysListKey(userId)
+
+	newTribble := createNewTribbleNow(userId, contents)
+	newTribJson, jsonErr := tribbleToJson(newTribble)
+	if jsonErr != nil {
+		return jsonErr
+	}
+	newTribJson = string(newTribJson)
+	newTribKey := generateSingleTribKey(newTribble)
+
+	// add the new tribble post's json data as an entry on the storage server
+	ts.myLibstore.Put(newTribKey, newTribJson)
+	// add the new tribble post's key to the overall trib list for the user
+	ts.myLibstore.AppendToList(allTribKeylistKey, newTribKey)
+
+	// also add to the recent tribbles list for the user
+	ts.myLibstore.AppendToList(recentTribKeys, newTribKey)
+
+	// remove the oldest tribbles in the recent tribs list to bring it back
+	// under the maximum tribs limit
+	recentTribKeyList, recentTribsErr := ts.myLibstore.GetList(recentTribKeylistKey)
+	if recentTribsErr == nil {
+		// since we are limited in how many rpc calls we can make here, we
+		// assume that since we always append newest tribs to the end of the
+		// recent list, we'll remove the front few tribbles, which will be the
+		// oldest until we are back under the _MAX_RECENT_TRIBS limit
+		for i := 0; i < len(recentTribKeyList)-_MAX_RECENT_TRIBS; i++ {
+			// drop the tribble from the recent triblist (but not globally!)
+			tribKeyToDrop := recentTribKeyList[i]
+			ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKeyToDrop)
+		}
+	}
+
+	reply.Status = tribrpc.OK
+	return nil
 }
 
 func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
@@ -183,6 +241,41 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 
 	ts.serverLock.Lock()
 	defer ts.serverLock.Unlock()
+
+	userId := args.UserID
+	if !ts.doesUserExist(userId) {
+		reply.Status = tribrpc.NoSuchUser
+		reply.Tribbles = nil
+		return nil
+	}
+
+	recentTribKeylistKey := generateUserRecentTribKeysListKey(userId)
+	recentTribKeyList, err := ts.myLibstore.GetList(recentTribKeylistKey)
+	if err != nil {
+		recentTribKeyList = make([]string, 0)
+	}
+
+	// retrieve the actual trib data corresponding to each key in the recent
+	// key list
+	recentTribList := make([]Tribble, 0)
+	for _, tribKey := range recentTribKeyList {
+		tribJson, err := ts.myLibstore.Get(tribKey)
+		if err != nil {
+			errMsg := fmt.Sprintf("GetTribbles error while retrieving %s: %s", tribKey, err.Error())
+			_DEBUGLOG.Println(errMsg)
+			return errors.New(errMsg)
+		}
+
+		rawTrib, err := jsonToTribble(tribJson)
+		if err != nil || rawTrib == nil {
+			errMsg := fmt.Sprintf("GetTribbles JSON error on key %s: %s", tribKey, err.Error())
+			_DEBUGLOG.Println(errMsg)
+			return errors.New(errMsg)
+		}
+		recentTribList = append(recentTribList, *rawTrib)
+	}
+	// actually sort the tribbles list by newest first
+	sort.Sort(sortTribNewestFirst(recentTribList))
 
 	return errors.New("not implemented")
 }
@@ -193,6 +286,12 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 
 	ts.serverLock.Lock()
 	defer ts.serverLock.Unlock()
+
+	userId := args.UserID
+	if !ts.doesUserExist(userId) {
+		reply.Status = tribrpc.NoSuchUser
+		return nil
+	}
 
 	return errors.New("not implemented")
 }
