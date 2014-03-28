@@ -89,7 +89,7 @@ func generateUserRecentTribKeysListKey(user string) string {
 // user
 func generateSingleTribKey(trib *tribrpc.Tribble) string {
 	tribbleJson, _ := tribbleToJson(trib)
-	tribbleHash := sha256Hash(tribbleJson)
+	tribbleHash := md5Hash(tribbleJson)
 	return fmt.Sprintf("%s:post-%s", trib.UserID, tribbleHash)
 }
 
