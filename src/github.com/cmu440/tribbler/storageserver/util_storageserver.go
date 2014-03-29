@@ -67,7 +67,7 @@ func getHashRingNodeIndex(hashRing []storagerpc.Node, nodeID uint32) int {
 
 // gets the hash value of the key, based on the substring before the first colon
 // in the key, if available
-func hashKeyPrefix(key string) uint32 {
+func HashKeyPrefix(key string) uint32 {
 	sep := ":"
 	numSubstrs := 2
 

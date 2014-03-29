@@ -121,7 +121,7 @@ func (ss *storageServer) isKeyInHashRange(key string) bool {
 			thisNodeID, ss.hashRing)
 	}
 
-	keyHashID := hashKeyPrefix(key)
+	keyHashID := HashKeyPrefix(key)
 
 	if prevNodeID < thisNodeID {
 		return prevNodeID < keyHashID && keyHashID <= thisNodeID
@@ -409,7 +409,7 @@ func (ss *storageServer) validateServerKey(key string,
 		return false
 	} else if !ss.isKeyInHashRange(key) {
 		_DEBUGLOG.Printf("%s is wrong server for hash %v\n",
-			nodeToStr(ss.thisNode), hashKeyPrefix(key))
+			nodeToStr(ss.thisNode), HashKeyPrefix(key))
 		onWrongServer()
 		return false
 	}
