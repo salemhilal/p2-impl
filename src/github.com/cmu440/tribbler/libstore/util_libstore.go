@@ -62,7 +62,7 @@ func getNodeForHashKey(hashRing []storagerpc.Node, key string) *storagerpc.Node 
 	// Go over each hash element
 	for _, node := range hashRing {
 		_DEBUGLOG.Println("Checking node:", nodeToStr(&node))
-		if node.NodeID > hash {
+		if node.NodeID >= hash {
 			return &node
 		}
 	}
