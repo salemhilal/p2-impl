@@ -74,6 +74,9 @@ type storageServer struct {
 
 	// locks to use for blocking leasing on specific keys
 	keyPermissionLocks map[string](*sync.Mutex)
+	// whether or not leases are allowed to be granted on a key
+	keyLeasesAllowed map[string]bool
+
 	// a map of keys mapped to a map of all hostports
 	// that have active leases on the key. hostports are mapped to info
 	// regarding their holding status
@@ -155,6 +158,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		singleValueMap:     make(map[string]string),
 		listValueMap:       make(map[string]([]string)),
 		keyPermissionLocks: make(map[string](*sync.Mutex)),
+		keyLeasesAllowed:   make(map[string]bool),
 		leaseHolders:       make(map[string](map[string](*leaseHolderInfo))),
 		// remember to initialize prevNode, nextNode, and hashRing later!
 		prevNode: nil,
@@ -483,6 +487,14 @@ func (ss *storageServer) cacheNewLease(key string, hostport string) {
 	}
 }
 
+// NOT THREADSAFE; call after locking dataLock
+// returns the resulting lock used for the keyLock
+func (ss *storageServer) initNewKey(key string) {
+	ss.keyPermissionLocks[key] = new(sync.Mutex)
+	ss.keyLeasesAllowed[key] = true
+	ss.leaseHolders[key] = make(map[string](*leaseHolderInfo))
+}
+
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
 	_DEBUGLOG.Println("CALL Get", args)
 	defer _DEBUGLOG.Println("EXIT Get", args)
@@ -510,23 +522,20 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 		return nil
 	}
 
-	keyLock, lockExists := ss.keyPermissionLocks[key]
-	ss.dataLock.Unlock()
-
-	// lock the key outside of the data lock so that other modifications
-	// to the key's lease status do not occur concurrently, while still allowing
-	// other keys to be modified
+	_, lockExists := ss.keyPermissionLocks[key]
+	// check if leases are currently being granted for the key
+	leasesAllowed := true
 	if lockExists {
-		keyLock.Lock()
+		leasesAllowed = ss.keyLeasesAllowed[key]
 	}
-	ss.dataLock.Lock()
+
 	// actually access the key's value data
 	value, keyFound := ss.singleValueMap[key]
 
 	// initialize/refresh lease
 	replyLease := emptyLease
 	// only allow leases if not about to return a KeyNotFound status
-	if wantLease && keyFound {
+	if wantLease && keyFound && leasesAllowed {
 		replyLease = *makeLease()
 		ss.cacheNewLease(key, hostport)
 	}
@@ -543,9 +552,6 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	}
 
 	ss.dataLock.Unlock()
-	if lockExists {
-		keyLock.Unlock()
-	}
 	return nil
 }
 
@@ -636,9 +642,11 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	// that if this block runs concurrently with itself, only one actually
 	// initializes the new key lock
 	if !lockExists {
-		keyLock = new(sync.Mutex)
-		ss.keyPermissionLocks[key] = keyLock
-		ss.leaseHolders[key] = make(map[string](*leaseHolderInfo))
+		ss.initNewKey(key)
+		keyLock = ss.keyPermissionLocks[key]
+	} else {
+		// stop granting leases on this key until revoke is done
+		ss.keyLeasesAllowed[key] = false
 	}
 	ss.dataLock.Unlock()
 
@@ -651,6 +659,7 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	}
 
 	ss.dataLock.Lock()
+	ss.keyLeasesAllowed[key] = true
 	// actually put the value in the map
 	ss.singleValueMap[key] = value
 	reply.Status = storagerpc.OK
@@ -685,21 +694,19 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 		ss.dataLock.Unlock()
 		return nil
 	}
-	keyLock, lockExists := ss.keyPermissionLocks[key]
-	ss.dataLock.Unlock()
-
-	// lock the key outside of the data lock
+	_, lockExists := ss.keyPermissionLocks[key]
+	leasesAllowed := true
 	if lockExists {
-		keyLock.Lock()
+		leasesAllowed = ss.keyLeasesAllowed[key]
 	}
-	ss.dataLock.Lock()
+
 	// actually access the key's value data
 	value, keyFound := ss.listValueMap[key]
 
 	// initialize/refresh lease
 	replyLease := emptyLease
 	// only allow leases if not about to return a KeyNotFound status
-	if wantLease && keyFound {
+	if wantLease && keyFound && leasesAllowed {
 		replyLease = *makeLease()
 		ss.cacheNewLease(key, hostport)
 	}
@@ -715,9 +722,6 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	}
 
 	ss.dataLock.Unlock()
-	if lockExists {
-		keyLock.Unlock()
-	}
 	return nil
 }
 
@@ -760,9 +764,11 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	// that if this block runs concurrently with itself, only one actually
 	// initializes the new key lock
 	if !lockExists {
-		keyLock = new(sync.Mutex)
-		ss.keyPermissionLocks[key] = keyLock
-		ss.leaseHolders[key] = make(map[string](*leaseHolderInfo))
+		ss.initNewKey(key)
+		keyLock = ss.keyPermissionLocks[key]
+	} else {
+		// stop granting leases on this key until revoke is done
+		ss.keyLeasesAllowed[key] = false
 	}
 	ss.dataLock.Unlock()
 
@@ -775,6 +781,8 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	}
 
 	ss.dataLock.Lock()
+	ss.keyLeasesAllowed[key] = true // reallow lease granting
+
 	oldList, hasList := ss.listValueMap[key]
 	// initialize empty list if no list has been mapped yet
 	if !hasList {
@@ -842,9 +850,10 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	// that if this block runs concurrently with itself, only one actually
 	// initializes the new key lock
 	if !lockExists {
-		keyLock = new(sync.Mutex)
-		ss.keyPermissionLocks[key] = keyLock
-		ss.leaseHolders[key] = make(map[string](*leaseHolderInfo))
+		ss.initNewKey(key)
+		keyLock = ss.keyPermissionLocks[key]
+	} else {
+		ss.keyLeasesAllowed[key] = false
 	}
 	ss.dataLock.Unlock()
 
@@ -857,6 +866,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	}
 
 	ss.dataLock.Lock()
+	ss.keyLeasesAllowed[key] = true
 	oldList, hasList := ss.listValueMap[key]
 	// if no list has been mapped yet, return ItemNotFound status
 	if !hasList {
