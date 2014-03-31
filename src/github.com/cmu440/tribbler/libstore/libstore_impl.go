@@ -3,6 +3,7 @@ package libstore
 import (
 	"errors"
 	"net/rpc"
+	"sync"
 	"time"
 
 	"github.com/cmu440/tribbler/rpc/librpc"
@@ -21,6 +22,9 @@ type libstore struct {
 
 	// Maps storage nodeID's to their respective clients.
 	serverClients map[uint32]*rpc.Client
+
+	// Lock for serverClients.
+	clientsLock sync.RWMutex
 }
 
 const (
@@ -70,14 +74,14 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	_DEBUGLOG.Println("GetServers response:", reply.Status)
 
 	// Should we try and timeout (i.e. is err == nil)?
-	for attempts := 1; err != nil && reply.Status != storagerpc.OK; attempts++ {
-		_DEBUGLOG.Println("Error while attempting", err)
+	for attempts := 1; err != nil || reply.Status != storagerpc.OK; attempts++ {
+		_DEBUGLOG.Println("Error while attempting: ", err)
 		// Have we timed out?
 		if attempts >= RETRY_LIMIT {
 			return nil, errors.New("Connection timeout calling GetServers")
 		}
-		time.Sleep(1 * time.Second)                                            // Sleep a second
-		err = masterServerClient.Call("StorageServer.GetServers", args, reply) // Try to call again
+		time.Sleep(1 * time.Second)                                             // Sleep a second
+		err = masterServerClient.Call("StorageServer.GetServers", args, &reply) // Try to call again
 		_DEBUGLOG.Println("GetServers response:", reply.Status)
 	}
 	// At this point, we should have a list of servers.
