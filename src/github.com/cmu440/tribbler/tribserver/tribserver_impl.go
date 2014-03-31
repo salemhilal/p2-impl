@@ -76,7 +76,7 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 
 	userId := args.UserID
 	// check to see if the user exists
-	if !ts.doesUserExist(userId) {
+	if ts.doesUserExist(userId) {
 		reply.Status = tribrpc.Exists
 	} else {
 		// initialize user data with empty string to mark as existing
