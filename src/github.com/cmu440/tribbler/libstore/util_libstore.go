@@ -1,6 +1,7 @@
 package libstore
 
 import (
+	"fmt"
 	"log"
 	"net/rpc"
 	"os"
@@ -42,20 +43,31 @@ func HashKeyPrefix(key string) uint32 {
 	return StoreHash(prefix)
 }
 
+// converts a Node into a human readable string for debugging
+func nodeToStr(node *storagerpc.Node) string {
+	if node == nil {
+		return "null"
+	}
+	return fmt.Sprintf("Node<%d@%s>", node.NodeID, node.HostPort)
+}
+
 // Given a hash ring and a key, returns the Node that the key hashes to.
 // Assumes hashRing sorted in increasing order by NodeID
 func getNodeForHashKey(hashRing []storagerpc.Node, key string) *storagerpc.Node {
+	_DEBUGLOG.Println("Hash ring", hashRing)
 	// Get hash of key prefix
 	hash := HashKeyPrefix(key)
+	_DEBUGLOG.Println("Hash key prefix:", hash)
 
 	// Go over each hash element
 	for _, node := range hashRing {
+		_DEBUGLOG.Println("Checking node:", nodeToStr(&node))
 		if node.NodeID > hash {
 			return &node
 		}
 	}
 
-	// This is mostly for sanity checking, we should never hit this segment.
-	_DEBUGLOG.Fatalln("No server in ring found for hash: ", key)
-	return nil
+	// If we're here, hash is greater than all node ID's, so it
+	// must belong to the first node, as it's the one "above."
+	return &hashRing[0]
 }

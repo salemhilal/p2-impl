@@ -66,16 +66,19 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	// Get server list. If not ready, sleep for a second, retry 5 times
 	args := &storagerpc.GetServersArgs{}
 	var reply storagerpc.GetServersReply
-	err = masterServerClient.Call("GetServers", args, &reply)
+	err = masterServerClient.Call("StorageServer.GetServers", args, &reply)
+	_DEBUGLOG.Println("GetServers response:", reply.Status)
 
 	// Should we try and timeout (i.e. is err == nil)?
-	for attempts := 1; err == nil && reply.Status == storagerpc.NotReady; attempts++ {
+	for attempts := 1; err != nil && reply.Status != storagerpc.OK; attempts++ {
+		_DEBUGLOG.Println("Error while attempting", err)
 		// Have we timed out?
 		if attempts >= RETRY_LIMIT {
 			return nil, errors.New("Connection timeout calling GetServers")
 		}
-		time.Sleep(1 * time.Second)                              // Sleep a second
-		err = masterServerClient.Call("GetServers", args, reply) // Try to call again
+		time.Sleep(1 * time.Second)                                            // Sleep a second
+		err = masterServerClient.Call("StorageServer.GetServers", args, reply) // Try to call again
+		_DEBUGLOG.Println("GetServers response:", reply.Status)
 	}
 	// At this point, we should have a list of servers.
 	// Pack up the libstore
@@ -114,7 +117,7 @@ func (ls *libstore) Get(key string) (string, error) {
 	}
 
 	// make the call
-	if err := client.Call("Get", args, &reply); err != nil {
+	if err := client.Call("StorageServer.Get", args, &reply); err != nil {
 		return "", err
 	}
 
@@ -149,7 +152,7 @@ func (ls *libstore) Put(key, value string) error {
 	}
 
 	// Make the call
-	if err := client.Call("Put", args, &reply); err != nil {
+	if err := client.Call("StorageServer.Put", args, &reply); err != nil {
 		return err
 	}
 
@@ -182,7 +185,7 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	}
 
 	// make the call
-	if err := client.Call("GetList", args, &reply); err != nil {
+	if err := client.Call("StorageServer.GetList", args, &reply); err != nil {
 		return nil, err
 	}
 
@@ -216,7 +219,7 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	}
 
 	// Make the call
-	if err := client.Call("RemoveFromList", args, &reply); err != nil {
+	if err := client.Call("StorageServer.RemoveFromList", args, &reply); err != nil {
 		return err
 	}
 
@@ -250,7 +253,7 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	}
 
 	// Make the call
-	if err := client.Call("AppendToList", args, &reply); err != nil {
+	if err := client.Call("StorageServer.AppendToList", args, &reply); err != nil {
 		return err
 	}
 
