@@ -5,6 +5,8 @@
 # Folders
 _obj
 _test
+bin/goimports
+src/code.google.com
 
 # Architecture specific extensions/prefixes
 *.[568vq]
