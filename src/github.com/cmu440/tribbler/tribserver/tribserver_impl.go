@@ -182,8 +182,16 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 }
 
 func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.PostTribbleReply) error {
-	_DEBUGLOG.Println("CALL PostTribble", args)
-	defer _DEBUGLOG.Println("EXIT PostTribble", args, reply)
+	// get post contents in a shortened human readable form for debugging
+	maxContentDebugLen := 140
+	debug_contents := args.Contents
+	if len(args.Contents) > maxContentDebugLen {
+		charsOmitted := len(args.Contents) - maxContentDebugLen
+		debug_contents = args.Contents[:maxContentDebugLen] + fmt.Sprintf("<%d chars omitted>", charsOmitted)
+	}
+
+	_DEBUGLOG.Println("CALL PostTribble", args.UserID, debug_contents)
+	defer _DEBUGLOG.Println("EXIT PostTribble", args.UserID, debug_contents, reply)
 
 	ts.serverLock.Lock()
 	defer ts.serverLock.Unlock()
@@ -217,11 +225,16 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	// remove the oldest tribbles in the recent tribs list to bring it back
 	// under the maximum tribs limit
 	recentTribKeyList, recentTribsErr := ts.myLibstore.GetList(recentTribKeylistKey)
+
+	// drops the oldest tribbles that are over the max limit;
+	// note that we don't throw an error if no list is retrieved, as this just
+	// means that the user hasn't posted any tribbles yet, so we don't need to
+	// drop any tribbles
 	if recentTribsErr == nil {
-		// since we are limited in how many rpc calls we can make here, we
-		// assume that since we always append newest tribs to the end of the
-		// recent list, we'll remove the front few tribbles, which will be the
-		// oldest until we are back under the _MAX_RECENT_TRIBS limit
+		// assume that since we always add newer posts at the end of the list,
+		// we can remove any older posts from the front of the list if it
+		// goes over the limit
+
 		for i := 0; i < len(recentTribKeyList)-_MAX_RECENT_TRIBS; i++ {
 			// drop the tribble from the recent triblist (but not globally!)
 			tribKeyToDrop := recentTribKeyList[i]
@@ -232,6 +245,27 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	// finally, remember to setup the reply
 	reply.Status = tribrpc.OK
 	return nil
+}
+
+func (ts *tribServer) mapTribKeysToTribbles(tribKeys []string) ([]tribrpc.Tribble, error) {
+	outputTribList := make([]tribrpc.Tribble, len(tribKeys))
+	for i, tribKey := range tribKeys {
+		tribJson, err := ts.myLibstore.Get(tribKey)
+		if err != nil {
+			errMsg := fmt.Sprintf("error while retrieving %s: %s", tribKey, err.Error())
+			_DEBUGLOG.Println(errMsg)
+			return nil, errors.New(errMsg)
+		}
+
+		rawTrib, err := jsonToTribble(([]byte)(tribJson))
+		if err != nil || rawTrib == nil {
+			errMsg := fmt.Sprintf("JSON error on key %s: %s", tribKey, err.Error())
+			_DEBUGLOG.Println(errMsg)
+			return nil, errors.New(errMsg)
+		}
+		outputTribList[i] = *rawTrib
+	}
+	return outputTribList, nil
 }
 
 func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
@@ -254,36 +288,25 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 		recentTribKeyList = make([]string, 0)
 	}
 
-	// retrieve the actual trib data corresponding to each key in the recent
-	// key list
-	recentTribList := make([]tribrpc.Tribble, 0)
-	for _, tribKey := range recentTribKeyList {
-		tribJson, err := ts.myLibstore.Get(tribKey)
-		if err != nil {
-			errMsg := fmt.Sprintf("GetTribbles error while retrieving %s: %s", tribKey, err.Error())
-			_DEBUGLOG.Println(errMsg)
-			return errors.New(errMsg)
-		}
+	// sort the tribble keys by newest first
+	sort.Sort(sortTribKeyNewestFirst(recentTribKeyList))
 
-		rawTrib, err := jsonToTribble(([]byte)(tribJson))
-		if err != nil || rawTrib == nil {
-			errMsg := fmt.Sprintf("GetTribbles JSON error on key %s: %s", tribKey, err.Error())
-			_DEBUGLOG.Println(errMsg)
-			return errors.New(errMsg)
-		}
-		recentTribList = append(recentTribList, *rawTrib)
-	}
-	// sort the tribbles list by newest first
-	sort.Sort(sortTribNewestFirst(recentTribList))
-
-	// remove tribbles that go beyond the max limit
-	if len(recentTribList) > _MAX_RECENT_TRIBS {
-		for i := _MAX_RECENT_TRIBS; i < len(recentTribList); i++ {
-			rawTrib := recentTribList[i]
-			tribKey := generateSingleTribKey(&rawTrib)
+	// drop tribble keys from the recent list that go beyond the max limit
+	if len(recentTribKeyList) > _MAX_RECENT_TRIBS {
+		for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
+			tribKey := recentTribKeyList[i]
 			ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKey)
 		}
-		recentTribList = recentTribList[:_MAX_RECENT_TRIBS]
+		recentTribKeyList = recentTribKeyList[:_MAX_RECENT_TRIBS]
+	}
+
+	// actually call Get to retrieve the actual trib data corresponding to
+	// each key in the recent key list
+	recentTribList, err := ts.mapTribKeysToTribbles(recentTribKeyList)
+	if err != nil {
+		errMsg := fmt.Sprintf("GetTribbles error while retrieving Tribbles: %s", err.Error())
+		_DEBUGLOG.Println(errMsg)
+		return errors.New(errMsg)
 	}
 
 	// finally, set up the reply params
@@ -298,11 +321,11 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	defer _DEBUGLOG.Println("EXIT GetTribblesBySubscription", args, reply)
 
 	ts.serverLock.Lock()
+	defer ts.serverLock.Unlock()
 
 	userId := args.UserID
 	if !ts.doesUserExist(userId) {
 		reply.Status = tribrpc.NoSuchUser
-		ts.serverLock.Unlock()
 		return nil
 	}
 
@@ -312,33 +335,38 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	if err != nil {
 		reply.Status = tribrpc.OK
 		reply.Tribbles = make([]tribrpc.Tribble, 0)
-		ts.serverLock.Unlock()
 		return nil
 	}
 
-	subbedRecentTribs := make([]tribrpc.Tribble, 0)
-	// unlock to allow us to use the lock-protected GetTribbles on
-	//individual subbed users
-	ts.serverLock.Unlock()
+	subbedRecentTribKeys := make([]string, 0)
 
-	// retrieve the most recent posts for each user
+	// retrieve the most recent post keys for each user
 	for _, userSubName := range userSubs {
-		args := &tribrpc.GetTribblesArgs{
-			UserID: userSubName,
-		}
-		var reply tribrpc.GetTribblesReply
-		err = ts.GetTribbles(args, &reply)
-		if err != nil || reply.Status != tribrpc.OK {
+		subRecentTribsKey := generateUserRecentTribKeysListKey(userSubName)
+		subTribKeys, err := ts.myLibstore.GetList(subRecentTribsKey)
+		if err != nil {
+			// if the subbed user hasn't made any posts, getlist will throw an
+			// error, so simply ignore
 			continue
+		} else {
+			// merge with posts list
+			subbedRecentTribKeys = append(subbedRecentTribKeys, subTribKeys...)
 		}
-		// merge with posts list
-		subbedRecentTribs = append(subbedRecentTribs, reply.Tribbles...)
 	}
 
 	// sort by newest first and cap to maximum
-	sort.Sort(sortTribNewestFirst(subbedRecentTribs))
-	if len(subbedRecentTribs) > _MAX_RECENT_TRIBS {
-		subbedRecentTribs = subbedRecentTribs[:_MAX_RECENT_TRIBS]
+	sort.Sort(sortTribKeyNewestFirst(subbedRecentTribKeys))
+	if len(subbedRecentTribKeys) > _MAX_RECENT_TRIBS {
+		subbedRecentTribKeys = subbedRecentTribKeys[:_MAX_RECENT_TRIBS]
+	}
+
+	// finally, actually retrieve and store the corresponding Tribble for the
+	// final list of keys
+	subbedRecentTribs, err := ts.mapTribKeysToTribbles(subbedRecentTribKeys)
+	if err != nil {
+		errMsg := fmt.Sprintf("GetTribblesBySubscription error whilt retrieving tribbles: %s", err.Error())
+		_DEBUGLOG.Println(errMsg)
+		return errors.New(errMsg)
 	}
 
 	reply.Status = tribrpc.OK
