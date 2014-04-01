@@ -54,14 +54,11 @@ func nodeToStr(node *storagerpc.Node) string {
 // Given a hash ring and a key, returns the Node that the key hashes to.
 // Assumes hashRing sorted in increasing order by NodeID
 func getNodeForHashKey(hashRing []storagerpc.Node, key string) *storagerpc.Node {
-	_DEBUGLOG.Println("Hash ring", hashRing)
 	// Get hash of key prefix
 	hash := HashKeyPrefix(key)
-	_DEBUGLOG.Println("Hash key prefix:", hash)
 
 	// Go over each hash element
 	for _, node := range hashRing {
-		_DEBUGLOG.Println("Checking node:", nodeToStr(&node))
 		if node.NodeID >= hash {
 			return &node
 		}

@@ -24,11 +24,22 @@ type libstore struct {
 	serverClients map[uint32]*rpc.Client
 
 	// Lock for serverClients.
-	clientsLock sync.RWMutex
+	clientsLock *sync.Mutex
+
+	// How often should we request leases?
+	mode LeaseMode
+
+	// key/value storage caches
+	singleValueMap map[string]string
+	listValueMap   map[string]([]string)
+
+	// cache locks
+	singleLock *sync.Mutex
+	listLock   *sync.Mutex
 }
 
 const (
-	RETRY_LIMIT = 5
+	RETRY_LIMIT = 5 // Times to retry the master storage server before giving up
 )
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -57,14 +68,16 @@ const (
 // simply reuse the TribServer's HTTP handler since the two run in the same process).
 func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libstore, error) {
 	// Get to leases later.
-	if mode != Never {
-		return nil, errors.New("Mode not implemented")
+	if mode == Normal {
+
+		mode = Always
 	}
 
 	// Connect to server
 	masterServerClient, err := dialRpcHostport(masterServerHostPort)
 	if err != nil {
 		_DEBUGLOG.Println("Failed to dial storage server", err)
+		return nil, errors.New("Failed to dial storage server")
 	}
 
 	// Get server list. If not ready, sleep for a second, retry 5 times
@@ -85,12 +98,19 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		_DEBUGLOG.Println("GetServers response:", reply.Status)
 	}
 	// At this point, we should have a list of servers.
+
 	// Pack up the libstore
 	lib := &libstore{
 		servers:              reply.Servers,
 		masterServerHostPort: masterServerHostPort,
 		hostPort:             myHostPort,
 		serverClients:        make(map[uint32]*rpc.Client),
+		clientsLock:          new(sync.Mutex),
+		mode:                 mode,
+		singleValueMap:       make(map[string]string),
+		listValueMap:         make(map[string]([]string)),
+		singleLock:           new(sync.Mutex),
+		listLock:             new(sync.Mutex),
 	}
 
 	// Register the lease callback rpc
@@ -106,6 +126,14 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 
 // Gets a key's singleton value from the data store, cacheing if necessary
 func (ls *libstore) Get(key string) (string, error) {
+	// Check the cache, see if any of this is necessary
+	ls.singleLock.Lock()
+	if val, ok := ls.singleValueMap[key]; ok == true {
+		ls.singleLock.Unlock()
+		return val, nil
+	}
+	ls.singleLock.Unlock()
+
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
 	if err != nil {
@@ -125,6 +153,14 @@ func (ls *libstore) Get(key string) (string, error) {
 		return "", err
 	}
 
+	// handle caching, if necessary
+	if ls.wantLease(key) == true &&
+		reply.Status == storagerpc.OK &&
+		reply.Lease.Granted == true {
+		// Spin off lease timer
+		go ls.singleLeaseTimer(reply.Lease, key, reply.Value)
+	}
+
 	// Handle the response
 	switch reply.Status {
 	case storagerpc.WrongServer: // Wrong server
@@ -142,6 +178,11 @@ func (ls *libstore) Get(key string) (string, error) {
 }
 
 func (ls *libstore) Put(key, value string) error {
+	// Invalidate any sort of cache entry there may be for this value
+	ls.singleLock.Lock()
+	delete(ls.singleValueMap, key)
+	ls.singleLock.Unlock()
+
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
 	if err != nil {
@@ -174,6 +215,14 @@ func (ls *libstore) Put(key, value string) error {
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
+	// Check the cache first
+	ls.listLock.Lock()
+	if list, ok := ls.listValueMap[key]; ok == true {
+		ls.listLock.Unlock()
+		return list, nil
+	}
+	ls.listLock.Unlock()
+
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
 	if err != nil {
@@ -193,6 +242,13 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 		return nil, err
 	}
 
+	// handle caching, if necessary
+	if ls.wantLease(key) == true &&
+		reply.Status == storagerpc.OK &&
+		reply.Lease.Granted == true {
+		go ls.listLeaseTimer(reply.Lease, key, reply.Value)
+	}
+
 	// handle the response
 	switch reply.Status {
 	case storagerpc.WrongServer:
@@ -209,6 +265,11 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
+	// Invalidate cache, if necessary
+	ls.listLock.Lock()
+	delete(ls.listValueMap, key)
+	ls.listLock.Unlock()
+
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
 	if err != nil {
@@ -243,6 +304,11 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 }
 
 func (ls *libstore) AppendToList(key, newItem string) error {
+	// Invalidate cache, if necessary
+	ls.listLock.Lock()
+	delete(ls.listValueMap, key)
+	ls.listLock.Unlock()
+
 	// Get the server the key belongs on
 	client, err := ls.getClientForKey(key)
 	if err != nil {
@@ -276,7 +342,59 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
-	return errors.New("not implemented")
+	_, ok := ls.singleValueMap[args.Key]
+	if ok == true { // Found key in single map
+		delete(ls.singleValueMap, args.Key)
+		reply.Status = storagerpc.OK
+		return nil
+	}
+
+	_, ok = ls.listValueMap[args.Key]
+	if ok == true { // Found key in list map
+		delete(ls.listValueMap, args.Key)
+		reply.Status = storagerpc.OK
+		return nil
+	}
+
+	// Didn't find any value associated with that key
+	reply.Status = storagerpc.KeyNotFound
+	return nil
+}
+
+//
+// LEASE FUNCTIONS
+//
+
+// Adds/removes single values from cache, handling timing and invalidation.
+// Must be called in goroutine
+func (ls *libstore) singleLeaseTimer(lease storagerpc.Lease, key, value string) {
+	ls.singleLock.Lock()
+	ls.singleValueMap[key] = value
+	ls.singleLock.Unlock()
+
+	// Wait until the entry should be invalidated
+	time.Sleep(time.Duration(lease.ValidSeconds) * time.Second)
+
+	// Invalidate cache (note that delete() doesn't act on empty entries)
+	ls.singleLock.Lock()
+	delete(ls.singleValueMap, key)
+	ls.singleLock.Unlock()
+}
+
+// Adds/removes list values from cache, handling timing and invalidation.
+// Must be called in goroutine
+func (ls *libstore) listLeaseTimer(lease storagerpc.Lease, key string, value []string) {
+	ls.listLock.Lock()
+	ls.listValueMap[key] = value
+	ls.listLock.Unlock()
+
+	// Wait until the entry should be invalidated
+	time.Sleep(time.Duration(lease.ValidSeconds) * time.Second)
+
+	// Invalidate cache (note that delete() doesn't act on empty entries)
+	ls.listLock.Lock()
+	delete(ls.listValueMap, key)
+	ls.listLock.Unlock()
 }
 
 //
@@ -286,6 +404,10 @@ func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storage
 // Given a node, get its client. Create it if it isn't already created.
 // Should be called synchronously.
 func (ls *libstore) getClientForNode(node *storagerpc.Node) (*rpc.Client, error) {
+
+	// Lock map access
+	ls.clientsLock.Lock()
+	defer ls.clientsLock.Unlock()
 
 	if client, ok := ls.serverClients[node.NodeID]; ok == true {
 		// Already have a clilent, return it
@@ -309,5 +431,9 @@ func (ls *libstore) getClientForKey(key string) (*rpc.Client, error) {
 // Determine whether or not we want a lease on a specified key
 func (ls *libstore) wantLease(key string) bool {
 	// TODO: Implement this
-	return false
+	if ls.mode == Never { // Never request lease
+		return false
+	} else { // Always request lease
+		return true
+	}
 }
