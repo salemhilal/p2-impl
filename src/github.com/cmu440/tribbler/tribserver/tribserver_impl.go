@@ -44,7 +44,7 @@ func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) 
 
 	// initialize a libstore on the same tribserver hostport
 	newLibstore, err := libstore.NewLibstore(masterServerHostPort,
-		rawServerData.hostport, libstore.Normal)
+		rawServerData.hostport, libstore.Never) // TODO: switch to Normal mode
 	if err != nil {
 		_DEBUGLOG.Println("error while initializing tribserver's libstore:", err)
 		return nil, err
@@ -71,9 +71,6 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 	_DEBUGLOG.Println("CALL CreateUser", args)
 	defer _DEBUGLOG.Println("EXIT CreateUser", args, reply)
 
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
-
 	userId := args.UserID
 	// check to see if the user exists
 	if ts.doesUserExist(userId) {
@@ -95,9 +92,6 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tribrpc.SubscriptionReply) error {
 	_DEBUGLOG.Println("CALL AddSubscription", args)
 	defer _DEBUGLOG.Println("EXIT AddSubscription", args, reply)
-
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
 
 	userId := args.UserID
 	targetId := args.TargetUserID
@@ -125,9 +119,6 @@ func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *
 	_DEBUGLOG.Println("CALL RemoveSubscription", args)
 	defer _DEBUGLOG.Println("EXIT RemoveSubscription", args, reply)
 
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
-
 	userId := args.UserID
 	targetId := args.TargetUserID
 
@@ -154,9 +145,6 @@ func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *
 func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply *tribrpc.GetSubscriptionsReply) error {
 	_DEBUGLOG.Println("CALL GetSubscriptions", args)
 	defer _DEBUGLOG.Println("EXIT GetSubscriptions", args, reply)
-
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
 
 	userId := args.UserID
 
@@ -193,9 +181,6 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	_DEBUGLOG.Println("CALL PostTribble", args.UserID, debug_contents)
 	defer _DEBUGLOG.Println("EXIT PostTribble", args.UserID, debug_contents, reply)
 
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
-
 	userId, contents := args.UserID, args.Contents
 	if !ts.doesUserExist(userId) {
 		reply.Status = tribrpc.NoSuchUser
@@ -231,14 +216,12 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	// means that the user hasn't posted any tribbles yet, so we don't need to
 	// drop any tribbles
 	if recentTribsErr == nil {
-		// assume that since we always add newer posts at the end of the list,
-		// we can remove any older posts from the front of the list if it
-		// goes over the limit
+		sort.Sort(sortTribKeyNewestFirst(recentTribKeyList))
 
-		for i := 0; i < len(recentTribKeyList)-_MAX_RECENT_TRIBS; i++ {
+		for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
 			// drop the tribble from the recent triblist (but not globally!)
 			tribKeyToDrop := recentTribKeyList[i]
-			ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKeyToDrop)
+			go ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKeyToDrop)
 		}
 	}
 
@@ -249,21 +232,39 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 
 func (ts *tribServer) mapTribKeysToTribbles(tribKeys []string) ([]tribrpc.Tribble, error) {
 	outputTribList := make([]tribrpc.Tribble, len(tribKeys))
-	for i, tribKey := range tribKeys {
-		tribJson, err := ts.myLibstore.Get(tribKey)
-		if err != nil {
-			errMsg := fmt.Sprintf("error while retrieving %s: %s", tribKey, err.Error())
-			_DEBUGLOG.Println(errMsg)
-			return nil, errors.New(errMsg)
-		}
 
-		rawTrib, err := jsonToTribble(([]byte)(tribJson))
-		if err != nil || rawTrib == nil {
-			errMsg := fmt.Sprintf("JSON error on key %s: %s", tribKey, err.Error())
-			_DEBUGLOG.Println(errMsg)
-			return nil, errors.New(errMsg)
+	numKeys := len(tribKeys)
+	// use a buffered channel to get result of parallel calls to Get
+	resultErrChan := make(chan error, numKeys)
+
+	for i, tribKey := range tribKeys {
+		// parallelize the process of mapping to tribbles
+		go func(i int, tribKey string) {
+			tribJson, err := ts.myLibstore.Get(tribKey)
+			if err != nil {
+				errMsg := fmt.Sprintf("error while retrieving %s: %s", tribKey, err.Error())
+				_DEBUGLOG.Println(errMsg)
+				resultErrChan <- errors.New(errMsg)
+			}
+
+			rawTrib, err := jsonToTribble(([]byte)(tribJson))
+			if err != nil || rawTrib == nil {
+				errMsg := fmt.Sprintf("JSON error on key %s: %s", tribKey, err.Error())
+				_DEBUGLOG.Println(errMsg)
+				resultErrChan <- errors.New(errMsg)
+			}
+			outputTribList[i] = *rawTrib
+			resultErrChan <- nil
+		}(i, tribKey)
+	}
+
+	// wait until all tribbles have been successfully mapped, aborting early if
+	// any cause an error
+	for seenResult := 0; seenResult < numKeys; seenResult++ {
+		resultErr := <-resultErrChan
+		if resultErr != nil {
+			return nil, resultErr
 		}
-		outputTribList[i] = *rawTrib
 	}
 	return outputTribList, nil
 }
@@ -271,9 +272,6 @@ func (ts *tribServer) mapTribKeysToTribbles(tribKeys []string) ([]tribrpc.Tribbl
 func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
 	_DEBUGLOG.Println("CALL GetTribbles", args)
 	defer _DEBUGLOG.Println("EXIT GetTribbles", args, reply)
-
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
 
 	userId := args.UserID
 	if !ts.doesUserExist(userId) {
@@ -295,7 +293,7 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 	if len(recentTribKeyList) > _MAX_RECENT_TRIBS {
 		for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
 			tribKey := recentTribKeyList[i]
-			ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKey)
+			go ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKey)
 		}
 		recentTribKeyList = recentTribKeyList[:_MAX_RECENT_TRIBS]
 	}
@@ -320,9 +318,6 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	_DEBUGLOG.Println("CALL GetTribblesBySubscription", args)
 	defer _DEBUGLOG.Println("EXIT GetTribblesBySubscription", args, reply)
 
-	ts.serverLock.Lock()
-	defer ts.serverLock.Unlock()
-
 	userId := args.UserID
 	if !ts.doesUserExist(userId) {
 		reply.Status = tribrpc.NoSuchUser
@@ -339,18 +334,31 @@ func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, r
 	}
 
 	subbedRecentTribKeys := make([]string, 0)
+	numSubs := len(userSubs)
+	subResultChan := make(chan []string, numSubs)
 
-	// retrieve the most recent post keys for each user
+	// retrieve the most recent post keys for each user, in parallel
 	for _, userSubName := range userSubs {
-		subRecentTribsKey := generateUserRecentTribKeysListKey(userSubName)
-		subTribKeys, err := ts.myLibstore.GetList(subRecentTribsKey)
-		if err != nil {
-			// if the subbed user hasn't made any posts, getlist will throw an
-			// error, so simply ignore
-			continue
-		} else {
+		go func(userSubName string) {
+			subRecentTribsKey := generateUserRecentTribKeysListKey(userSubName)
+			subTribKeys, err := ts.myLibstore.GetList(subRecentTribsKey)
+			if err != nil {
+				// if the subbed user hasn't made any posts, getlist will throw
+				// an error, so simply ignore and provide nil to the result chan
+				subResultChan <- nil
+			} else {
+				subResultChan <- subTribKeys
+			}
+		}(userSubName)
+	}
+
+	// wait for all parallel getlist calls to finish and merge into one list
+	// as they come in
+	for seenSubResults := 0; seenSubResults < numSubs; seenSubResults++ {
+		tribKeys := <-subResultChan
+		if tribKeys != nil {
 			// merge with posts list
-			subbedRecentTribKeys = append(subbedRecentTribKeys, subTribKeys...)
+			subbedRecentTribKeys = append(subbedRecentTribKeys, tribKeys...)
 		}
 	}
 

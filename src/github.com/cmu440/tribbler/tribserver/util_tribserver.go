@@ -6,12 +6,13 @@ import (
 	"github.com/cmu440/tribbler/rpc/tribrpc"
 	"log"
 	"net/rpc"
-	"os"
+	//"os"
+	"io/ioutil"
 	"strings"
 	"time"
 )
 
-var _DEBUGLOG = log.New(os.Stdout, "TRB: ", log.Lmicroseconds|log.Lshortfile)
+var _DEBUGLOG = log.New(ioutil.Discard, "TRB: ", log.Lmicroseconds|log.Lshortfile)
 var _MAX_RECENT_TRIBS = 100
 
 // JSON marshaling utility function

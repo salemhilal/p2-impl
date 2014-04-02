@@ -9,13 +9,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net/rpc"
-	"os"
+	//"os"
 	"sort"
 	"strings"
 	"time"
 )
 
-var _DEBUGLOG = log.New(os.Stdout, "STR: ", log.Lmicroseconds|log.Lshortfile)
+var _DEBUGLOG = log.New(ioutil.Discard, "STR: ", log.Lmicroseconds|log.Lshortfile)
 var _LOCKLOG = log.New(ioutil.Discard, "LCK: ", log.Lmicroseconds|log.Lshortfile)
 var _INIT_RETRY_INTERVAL = 1 * time.Second
 var _LEASE_EXPIRE_DURATION = (storagerpc.LeaseSeconds +
