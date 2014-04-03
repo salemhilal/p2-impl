@@ -73,11 +73,6 @@ const (
 // need to create a brand new HTTP handler to serve the requests (the Libstore may
 // simply reuse the TribServer's HTTP handler since the two run in the same process).
 func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libstore, error) {
-	// Get to leases later.
-	if mode == Normal {
-
-		mode = Always
-	}
 
 	// storagerpc.QueryCacheSeconds
 	// Connect to server
@@ -135,6 +130,9 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 
 // Gets a key's singleton value from the data store, cacheing if necessary
 func (ls *libstore) Get(key string) (string, error) {
+	// Update the frequency of requests
+	go ls.updateFreq(key)
+
 	// Check the cache, see if any of this is necessary
 	ls.singleLock.Lock()
 	if val, ok := ls.singleValueMap[key]; ok == true {
@@ -224,6 +222,9 @@ func (ls *libstore) Put(key, value string) error {
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
+	// Update request frequency
+	go ls.updateFreq(key)
+
 	// Check the cache first
 	ls.listLock.Lock()
 	if list, ok := ls.listValueMap[key]; ok == true {
@@ -426,6 +427,7 @@ func (ls *libstore) updateFreq(key string) {
 	ls.freqLock.Lock()
 	ls.freqCounter[key]--
 	ls.freqLock.Unlock()
+
 }
 
 //
