@@ -36,6 +36,12 @@ type libstore struct {
 	// cache locks
 	singleLock *sync.Mutex
 	listLock   *sync.Mutex
+
+	// Request frequency counter and lock. Map maps request keys to counts
+	// The idea is that each key corresponds to a count that is incremented
+	// upon request, and is decremented after QueryCacheSeconds time.
+	freqCounter map[string]uint32
+	freqLock    *sync.Mutex
 }
 
 const (
@@ -73,6 +79,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		mode = Always
 	}
 
+	// storagerpc.QueryCacheSeconds
 	// Connect to server
 	masterServerClient, err := dialRpcHostport(masterServerHostPort)
 	if err != nil {
@@ -111,6 +118,8 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		listValueMap:         make(map[string]([]string)),
 		singleLock:           new(sync.Mutex),
 		listLock:             new(sync.Mutex),
+		freqCounter:          make(map[string]uint32),
+		freqLock:             new(sync.Mutex),
 	}
 
 	// Register the lease callback rpc
@@ -382,7 +391,7 @@ func (ls *libstore) singleLeaseTimer(lease storagerpc.Lease, key, value string) 
 }
 
 // Adds/removes list values from cache, handling timing and invalidation.
-// Must be called in goroutine
+// Must be called as goroutine
 func (ls *libstore) listLeaseTimer(lease storagerpc.Lease, key string, value []string) {
 	ls.listLock.Lock()
 	ls.listValueMap[key] = value
@@ -395,6 +404,28 @@ func (ls *libstore) listLeaseTimer(lease storagerpc.Lease, key string, value []s
 	ls.listLock.Lock()
 	delete(ls.listValueMap, key)
 	ls.listLock.Unlock()
+}
+
+// Increments frequency of key, and then decrements it after QueryCacheSecs
+// Must be called as goroutine
+func (ls *libstore) updateFreq(key string) {
+	// Increment freq for key
+	ls.freqLock.Lock()
+	_, ok := ls.freqCounter[key]
+	if ok == true {
+		ls.freqCounter[key]++
+	} else {
+		ls.freqCounter[key] = 1
+	}
+	ls.freqLock.Unlock()
+
+	// Wait for frequency to decrement
+	time.Sleep(time.Duration(storagerpc.QueryCacheSeconds) * time.Second)
+
+	// Decrement frequency
+	ls.freqLock.Lock()
+	ls.freqCounter[key]--
+	ls.freqLock.Unlock()
 }
 
 //
@@ -433,7 +464,12 @@ func (ls *libstore) wantLease(key string) bool {
 	// TODO: Implement this
 	if ls.mode == Never { // Never request lease
 		return false
-	} else { // Always request lease
+	} else if ls.mode == Always { // Always request lease
 		return true
+	} else { // Eh, it depends, see if curent freq is above threshold
+		ls.freqLock.Lock()
+		result := ls.freqCounter[key] > storagerpc.QueryCacheThresh
+		ls.freqLock.Unlock()
+		return result
 	}
 }
