@@ -70,6 +70,10 @@ type storageServer struct {
 	singleValueMap map[string]string
 	listValueMap   map[string]([]string)
 
+	// a map of keys mapped to a set of the list members
+	// for all kys in listValue map, to be used in membership checking
+	listValueMembershipSets map[string](map[string]bool)
+
 	// lease-tracking data types
 
 	// locks to use for blocking leasing on specific keys
@@ -153,18 +157,19 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	}
 
 	rawServerData := &storageServer{
-		dataLock:           new(sync.Mutex),
-		masterHostport:     masterServerHostPort,
-		isMaster:           (len(masterServerHostPort) == 0),
-		clusterIsReady:     false,
-		numNodes:           numNodes,
-		thisNode:           thisNode,
-		singleValueMap:     make(map[string]string),
-		listValueMap:       make(map[string]([]string)),
-		keyPermissionLocks: make(map[string](*sync.Mutex)),
-		keyLeasesAllowed:   make(map[string]bool),
-		leaseHolders:       make(map[string](map[string](*leaseHolderInfo))),
-		rpcClientCache:     make(map[string](*rpc.Client)),
+		dataLock:                new(sync.Mutex),
+		masterHostport:          masterServerHostPort,
+		isMaster:                (len(masterServerHostPort) == 0),
+		clusterIsReady:          false,
+		numNodes:                numNodes,
+		thisNode:                thisNode,
+		singleValueMap:          make(map[string]string),
+		listValueMap:            make(map[string]([]string)),
+		listValueMembershipSets: make(map[string](map[string]bool)),
+		keyPermissionLocks:      make(map[string](*sync.Mutex)),
+		keyLeasesAllowed:        make(map[string]bool),
+		leaseHolders:            make(map[string](map[string](*leaseHolderInfo))),
+		rpcClientCache:          make(map[string](*rpc.Client)),
 		// remember to initialize prevNode, nextNode, and hashRing later!
 		prevNode: nil,
 		nextNode: nil,
@@ -808,25 +813,28 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	ss.keyLeasesAllowed[key] = true // reallow lease granting
 
 	oldList, hasList := ss.listValueMap[key]
+	var membershipSet map[string]bool
 	// initialize empty list if no list has been mapped yet
 	if !hasList {
 		oldList = make([]string, 0)
+		membershipSet = make(map[string]bool)
+	} else {
+		membershipSet = ss.listValueMembershipSets[key]
 	}
 
-	itemFound := false
 	// check that the value is not already in the list
-	for i := 0; i < len(oldList); i++ {
-		if oldList[i] == value {
-			itemFound = true
-			break
-		}
-	}
+	_, itemFound := membershipSet[value]
 
 	if itemFound {
 		reply.Status = storagerpc.ItemExists
 	} else {
 		// update the list
 		ss.listValueMap[key] = append(oldList, value)
+
+		// update the membership set
+		membershipSet[value] = true
+		ss.listValueMembershipSets[key] = membershipSet
+
 		reply.Status = storagerpc.OK
 	}
 	ss.dataLock.Unlock()
@@ -896,24 +904,31 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	if !hasList {
 		reply.Status = storagerpc.ItemNotFound
 	} else {
-		foundIndex := -1
-		// find index of item to remove
-		for i := 0; i < len(oldList); i++ {
-			if oldList[i] == value {
-				foundIndex = i
-				break
-			}
-		}
+		oldMembershipSet := ss.listValueMembershipSets[key]
+		_, isInList := oldMembershipSet[value]
 
-		if foundIndex < 0 {
-			// if item was never found, return ItemNotFound
-			reply.Status = storagerpc.ItemNotFound
-		} else {
-			// otherwise, actually remove the item and return OK status
+		if isInList {
+			foundIndex := -1
+			// find index of item to remove
+			for i := 0; i < len(oldList); i++ {
+				if oldList[i] == value {
+					foundIndex = i
+					break
+				}
+			}
+
+			// actually remove the item and return OK status
 			prefix := oldList[:foundIndex]
 			suffix := oldList[foundIndex+1:]
 			ss.listValueMap[key] = append(prefix, suffix...)
+
+			delete(oldMembershipSet, value)
+			ss.listValueMembershipSets[key] = oldMembershipSet
+
 			reply.Status = storagerpc.OK
+		} else {
+			// if item was never found, return ItemNotFound
+			reply.Status = storagerpc.ItemNotFound
 		}
 	}
 
