@@ -216,12 +216,22 @@ func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.
 	// means that the user hasn't posted any tribbles yet, so we don't need to
 	// drop any tribbles
 	if recentTribsErr == nil {
-		sort.Sort(sortTribKeyNewestFirst(recentTribKeyList))
+		numRemoves := len(recentTribKeyList) - _MAX_RECENT_TRIBS
+		if numRemoves > 0 {
+			sort.Sort(sortTribKeyNewestFirst(recentTribKeyList))
+			removalSigChan := make(chan struct{}, numRemoves)
 
-		for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
-			// drop the tribble from the recent triblist (but not globally!)
-			tribKeyToDrop := recentTribKeyList[i]
-			go ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKeyToDrop)
+			for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
+				// drop the tribble from the recent triblist (but not globally!)
+				go func(tribKeyToDrop string) {
+					ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKeyToDrop)
+					removalSigChan <- struct{}{}
+				}(recentTribKeyList[i])
+			}
+			// wait for all removals to finish
+			for step := 0; step < numRemoves; step++ {
+				<-removalSigChan
+			}
 		}
 	}
 
@@ -289,13 +299,24 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 	// sort the tribble keys by newest first
 	sort.Sort(sortTribKeyNewestFirst(recentTribKeyList))
 
+	var removalSigChan chan struct{}
+	var numRemoves int
+
 	// drop tribble keys from the recent list that go beyond the max limit
 	if len(recentTribKeyList) > _MAX_RECENT_TRIBS {
+		numRemoves = len(recentTribKeyList) - _MAX_RECENT_TRIBS
+		removalSigChan = make(chan struct{}, numRemoves)
+
 		for i := _MAX_RECENT_TRIBS; i < len(recentTribKeyList); i++ {
-			tribKey := recentTribKeyList[i]
-			go ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKey)
+			go func(tribKey string) {
+				ts.myLibstore.RemoveFromList(recentTribKeylistKey, tribKey)
+				removalSigChan <- struct{}{}
+			}(recentTribKeyList[i])
 		}
 		recentTribKeyList = recentTribKeyList[:_MAX_RECENT_TRIBS]
+	} else {
+		removalSigChan = nil
+		numRemoves = 0
 	}
 
 	// actually call Get to retrieve the actual trib data corresponding to
@@ -305,6 +326,14 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 		errMsg := fmt.Sprintf("GetTribbles error while retrieving Tribbles: %s", err.Error())
 		_DEBUGLOG.Println(errMsg)
 		return errors.New(errMsg)
+	}
+
+	// wait for all removals to finish before returning, to prevent potential
+	// races with other methods
+	if removalSigChan != nil {
+		for step := 0; step < numRemoves; step++ {
+			<-removalSigChan
+		}
 	}
 
 	// finally, set up the reply params
