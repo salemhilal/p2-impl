@@ -44,7 +44,7 @@ func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) 
 
 	// initialize a libstore on the same tribserver hostport
 	newLibstore, err := libstore.NewLibstore(masterServerHostPort,
-		rawServerData.hostport, libstore.Never) // TODO: switch to Normal mode
+		rawServerData.hostport, libstore.Normal)
 	if err != nil {
 		_DEBUGLOG.Println("error while initializing tribserver's libstore:", err)
 		return nil, err
