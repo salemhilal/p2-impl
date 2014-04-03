@@ -437,13 +437,11 @@ func (ss *storageServer) deleteCachedLease(key string, hostport string) {
 }
 
 // does not remove the lease from the cache, make sure to call deleteCachedLease afterwards
-func (ss *storageServer) revokeLease(key string, hostport string, revokeSuccessSignal chan<- struct{}) (*storagerpc.RevokeLeaseReply, error) {
+func (ss *storageServer) revokeLease(key string, hostport string, revokeSuccessSignal chan struct{}) (*storagerpc.RevokeLeaseReply, error) {
 	_DEBUGLOG.Println("REVOKING lease for", key, hostport)
 	defer _DEBUGLOG.Println("REVOKED lease for", key, hostport)
 
-	defer func() {
-		revokeSuccessSignal <- struct{}{}
-	}()
+	defer close(revokeSuccessSignal)
 
 	args := &storagerpc.RevokeLeaseArgs{
 		Key: key,
@@ -452,13 +450,18 @@ func (ss *storageServer) revokeLease(key string, hostport string, revokeSuccessS
 
 	// check if the rpc client for this hostport is already cached from a
 	// previous dial. If not, dial and cache the rpc client for future use
+	ss.dataLock.Lock()
 	libStoreClient, clientCached := ss.rpcClientCache[hostport]
+	ss.dataLock.Unlock()
+
 	var err error = nil
 	if !clientCached {
 		_DEBUGLOG.Println("caching new rpc connection to", hostport)
 		libStoreClient, err = dialRpcHostport(hostport)
 		if err == nil {
+			ss.dataLock.Lock()
 			ss.rpcClientCache[hostport] = libStoreClient
+			ss.dataLock.Unlock()
 		}
 	} else {
 		_DEBUGLOG.Println("using existing rpc connection to", hostport)
@@ -608,8 +611,10 @@ func (ss *storageServer) blockUntilLeasesCleared(key string) {
 
 	for _, lease := range leasesToRevoke {
 		go func(lease *leaseHolderInfo) {
-			revokeSuccessSignal := make(chan struct{}, 1)
+			revokeSuccessSignal := make(chan struct{})
 
+			// do the revoke as well in order to allow the expire signal to 
+			// possibly come in
 			go ss.revokeLease(lease.key, lease.hostport, revokeSuccessSignal)
 			// wait until either the lease has been explicitly
 			// revoked or the lease has expired
