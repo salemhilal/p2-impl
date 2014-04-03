@@ -185,7 +185,7 @@ func (ls *libstore) Get(key string) (string, error) {
 		reply.Status == storagerpc.OK &&
 		reply.Lease.Granted == true {
 		// Spin off lease timer
-		go ls.singleLeaseTimer(reply.Lease, key, reply.Value)
+		ls.singleLeaseTimer(reply.Lease, key, reply.Value)
 	}
 
 	// Handle the response
@@ -278,7 +278,7 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	if ls.wantLease(key) == true &&
 		reply.Status == storagerpc.OK &&
 		reply.Lease.Granted == true {
-		go ls.listLeaseTimer(reply.Lease, key, reply.Value)
+		ls.listLeaseTimer(reply.Lease, key, reply.Value)
 	}
 
 	// handle the response
@@ -406,17 +406,18 @@ func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storage
 // Adds/removes single values from cache, handling timing and invalidation.
 // Must be called in goroutine
 func (ls *libstore) singleLeaseTimer(lease storagerpc.Lease, key, value string) {
+	// Add value to cache
 	ls.singleLock.Lock()
 	ls.singleValueMap[key] = value
 	ls.singleLock.Unlock()
 
 	// Wait until the entry should be invalidated
-	time.Sleep(time.Duration(lease.ValidSeconds) * time.Second)
-
-	// Invalidate cache (note that delete() doesn't act on empty entries)
-	ls.singleLock.Lock()
-	delete(ls.singleValueMap, key)
-	ls.singleLock.Unlock()
+	time.AfterFunc(time.Duration(lease.ValidSeconds)*time.Second, func() {
+		// Invalidate cache (note that delete() doesn't act on empty entries)
+		ls.singleLock.Lock()
+		delete(ls.singleValueMap, key)
+		ls.singleLock.Unlock()
+	})
 }
 
 // Adds/removes list values from cache, handling timing and invalidation.
@@ -427,12 +428,13 @@ func (ls *libstore) listLeaseTimer(lease storagerpc.Lease, key string, value []s
 	ls.listLock.Unlock()
 
 	// Wait until the entry should be invalidated
-	time.Sleep(time.Duration(lease.ValidSeconds) * time.Second)
+	time.AfterFunc(time.Duration(lease.ValidSeconds)*time.Second, func() {
+		// Invalidate cache (note that delete() doesn't act on empty entries)
+		ls.listLock.Lock()
+		delete(ls.listValueMap, key)
+		ls.listLock.Unlock()
+	})
 
-	// Invalidate cache (note that delete() doesn't act on empty entries)
-	ls.listLock.Lock()
-	delete(ls.listValueMap, key)
-	ls.listLock.Unlock()
 }
 
 // Increments frequency of key, and then decrements it after QueryCacheSecs
