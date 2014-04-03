@@ -578,6 +578,11 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 // but BEFORE locking ss.dataLock
 func (ss *storageServer) blockUntilLeasesCleared(key string) {
 	ss.dataLock.Lock()
+	if len(ss.leaseHolders[key]) == 0 {
+		ss.dataLock.Unlock()
+		return
+	}
+
 	// store leases in this slice so we still have access after unlocking
 	leasesToRevoke := make([](*leaseHolderInfo), 0)
 	for hostport, leaseInfo := range ss.leaseHolders[key] {
@@ -597,7 +602,7 @@ func (ss *storageServer) blockUntilLeasesCleared(key string) {
 
 	// revoke all leases in parallel
 	totalToRevoke := len(leasesToRevoke)
-	leaseDoneChan := make(chan struct{})
+	leaseDoneChan := make(chan struct{}, totalToRevoke)
 
 	_DEBUGLOG.Println("leases to revoke", leasesToRevoke)
 
