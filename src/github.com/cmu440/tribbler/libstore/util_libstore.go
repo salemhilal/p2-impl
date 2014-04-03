@@ -2,6 +2,7 @@ package libstore
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 var _DEBUGLOG = log.New(os.Stdout, "LBS-DEBUG: ", log.Lmicroseconds|log.Lshortfile)
 var _ERRORLOG = log.New(os.Stdout, "LBS-ERROR: ", log.Lmicroseconds|log.Lshortfile)
+var _FUNCLOG = log.New(ioutil.Discard, "LBS-FUNC: ", log.Lmicroseconds|log.Lshortfile)
 
 // Convenience wrapper for DialHTTP
 func dialRpcHostport(hostport string) (*rpc.Client, error) {

@@ -55,6 +55,8 @@ type libstore struct {
 	// a *freqReq struct is sent over freqCheck whenever a count is requested
 	freqAdd   chan string
 	freqCheck chan *freqReq
+	// to completely clear the frequency cache for the key sent over the chan
+	freqClear chan string
 }
 
 const (
@@ -130,6 +132,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		freqLock:             new(sync.Mutex),
 		freqAdd:              make(chan string, 10), // TODO: play with buffer size
 		freqCheck:            make(chan *freqReq, 10),
+		freqClear:            make(chan string, 10),
 	}
 
 	// Start up frequency manager
@@ -148,6 +151,9 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 
 // Gets a key's singleton value from the data store, cacheing if necessary
 func (ls *libstore) Get(key string) (string, error) {
+	_FUNCLOG.Println("START libstore GET")
+	defer _FUNCLOG.Println("STOP libstore GET")
+
 	// Update the frequency of requests
 	if ls.mode == Normal {
 		go ls.updateFreq(key)
@@ -205,10 +211,17 @@ func (ls *libstore) Get(key string) (string, error) {
 }
 
 func (ls *libstore) Put(key, value string) error {
+	_FUNCLOG.Println("START libstore PUT")
+	defer _FUNCLOG.Println("STOP libstore PUT")
+
 	// Invalidate any sort of cache entry there may be for this value
 	ls.singleLock.Lock()
 	delete(ls.singleValueMap, key)
 	ls.singleLock.Unlock()
+
+	if ls.mode == Normal {
+		ls.freqClear <- key
+	}
 
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
@@ -242,6 +255,9 @@ func (ls *libstore) Put(key, value string) error {
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
+	_FUNCLOG.Println("START libstore GETLIST")
+	defer _FUNCLOG.Println("STOP libstore GETLIST")
+
 	// Update request frequency
 	if ls.mode == Normal {
 		go ls.updateFreq(key)
@@ -297,10 +313,17 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
+	_FUNCLOG.Println("START libstore REMOVELIST")
+	defer _FUNCLOG.Println("STOP libstore REMOVELIST")
+
 	// Invalidate cache, if necessary
 	ls.listLock.Lock()
 	delete(ls.listValueMap, key)
 	ls.listLock.Unlock()
+
+	if ls.mode == Normal {
+		ls.freqClear <- key
+	}
 
 	// Get the server the key belongs on.
 	client, err := ls.getClientForKey(key)
@@ -336,10 +359,17 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 }
 
 func (ls *libstore) AppendToList(key, newItem string) error {
+	_FUNCLOG.Println("START libstore APPENDLIST")
+	defer _FUNCLOG.Println("STOP libstore APPENDLIST")
+
 	// Invalidate cache, if necessary
 	ls.listLock.Lock()
 	delete(ls.listValueMap, key)
 	ls.listLock.Unlock()
+
+	if ls.mode == Normal {
+		ls.freqClear <- key
+	}
 
 	// Get the server the key belongs on
 	client, err := ls.getClientForKey(key)
@@ -354,10 +384,13 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 		Value: newItem,
 	}
 
+	_FUNCLOG.Println("calling storageserver appendlist")
 	// Make the call
 	if err := client.Call("StorageServer.AppendToList", args, &reply); err != nil {
+		_FUNCLOG.Println("error while calling appendlist", err)
 		return err
 	}
+	_FUNCLOG.Println("finished calling storageserver appendlist")
 
 	switch reply.Status {
 	case storagerpc.WrongServer:
@@ -374,6 +407,9 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
+	_FUNCLOG.Println("START libstore REVOKELEASE", args)
+	defer _FUNCLOG.Println("STOP libstore REVOKELEASE", args, reply)
+
 	ls.singleLock.Lock()
 	_, ok := ls.singleValueMap[args.Key]
 	if ok == true { // Found key in single map
@@ -500,6 +536,15 @@ func (ls *libstore) freqManager() {
 					total += count
 				}
 				req.resp <- total
+			}
+		// if frequency is told to clear frequency cache for a specific key
+		case key := <-ls.freqClear:
+			counts, ok := freqMap[key]
+			if ok {
+				for i := 0; i < len(counts); i++ {
+					counts[i] = 0
+				}
+				freqMap[key] = counts
 			}
 		}
 	}
