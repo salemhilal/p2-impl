@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/rpc"
 	"sort"
+	"sync"
 )
 
 type tribServer struct {
 	hostport   string
 	myLibstore libstore.Libstore
+	serverLock *sync.Mutex
 }
 
 // NewTribServer creates, starts and returns a new TribServer. masterServerHostPort
@@ -26,6 +28,7 @@ func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) 
 	rawServerData := &tribServer{
 		hostport:   myHostPort,
 		myLibstore: nil,
+		serverLock: new(sync.Mutex),
 	}
 
 	// make server methods available for rpc
