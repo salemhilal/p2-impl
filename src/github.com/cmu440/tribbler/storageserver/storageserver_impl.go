@@ -613,7 +613,7 @@ func (ss *storageServer) blockUntilLeasesCleared(key string) {
 		go func(lease *leaseHolderInfo) {
 			revokeSuccessSignal := make(chan struct{})
 
-			// do the revoke as well in order to allow the expire signal to 
+			// do the revoke as well in order to allow the expire signal to
 			// possibly come in
 			go ss.revokeLease(lease.key, lease.hostport, revokeSuccessSignal)
 			// wait until either the lease has been explicitly
