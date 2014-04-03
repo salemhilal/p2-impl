@@ -10,6 +10,12 @@ import (
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 )
 
+// For requesting the current frequency count of a key
+type freqReq struct {
+	key  string      // The key we want the frequency of
+	resp chan uint32 // Channel to transmit the count over
+}
+
 type libstore struct {
 	// List of storage servers
 	servers []storagerpc.Node
@@ -40,8 +46,15 @@ type libstore struct {
 	// Request frequency counter and lock. Map maps request keys to counts
 	// The idea is that each key corresponds to a count that is incremented
 	// upon request, and is decremented after QueryCacheSeconds time.
+	// TODO: Get rid of these
 	freqCounter map[string]uint32
 	freqLock    *sync.Mutex
+
+	// Channels to facilitate frequency counting.
+	// a key is sent over freqAdd whenever it is requested
+	// a *freqReq struct is sent over freqCheck whenever a count is requested
+	freqAdd   chan string
+	freqCheck chan *freqReq
 }
 
 const (
@@ -115,7 +128,12 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		listLock:             new(sync.Mutex),
 		freqCounter:          make(map[string]uint32),
 		freqLock:             new(sync.Mutex),
+		freqAdd:              make(chan string, 10), // TODO: play with buffer size
+		freqCheck:            make(chan *freqReq, 10),
 	}
+
+	// Start up frequency manager
+	go lib.freqManager()
 
 	// Register the lease callback rpc
 	rpc.RegisterName("LeaseCallbacks", librpc.Wrap(lib))
@@ -131,7 +149,9 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 // Gets a key's singleton value from the data store, cacheing if necessary
 func (ls *libstore) Get(key string) (string, error) {
 	// Update the frequency of requests
-	go ls.updateFreq(key)
+	if ls.mode == Normal {
+		go ls.updateFreq(key)
+	}
 
 	// Check the cache, see if any of this is necessary
 	ls.singleLock.Lock()
@@ -223,7 +243,9 @@ func (ls *libstore) Put(key, value string) error {
 
 func (ls *libstore) GetList(key string) ([]string, error) {
 	// Update request frequency
-	go ls.updateFreq(key)
+	if ls.mode == Normal {
+		go ls.updateFreq(key)
+	}
 
 	// Check the cache first
 	ls.listLock.Lock()
@@ -352,19 +374,25 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
+	ls.singleLock.Lock()
 	_, ok := ls.singleValueMap[args.Key]
 	if ok == true { // Found key in single map
 		delete(ls.singleValueMap, args.Key)
+		ls.singleLock.Unlock()
 		reply.Status = storagerpc.OK
 		return nil
 	}
+	ls.singleLock.Unlock()
 
+	ls.listLock.Lock()
 	_, ok = ls.listValueMap[args.Key]
 	if ok == true { // Found key in list map
 		delete(ls.listValueMap, args.Key)
+		ls.listLock.Unlock()
 		reply.Status = storagerpc.OK
 		return nil
 	}
+	ls.listLock.Unlock()
 
 	// Didn't find any value associated with that key
 	reply.Status = storagerpc.KeyNotFound
@@ -410,7 +438,9 @@ func (ls *libstore) listLeaseTimer(lease storagerpc.Lease, key string, value []s
 // Increments frequency of key, and then decrements it after QueryCacheSecs
 // Must be called as goroutine
 func (ls *libstore) updateFreq(key string) {
-	// Increment freq for key
+	ls.freqAdd <- key
+
+	/*/ Increment freq for key
 	ls.freqLock.Lock()
 	_, ok := ls.freqCounter[key]
 	if ok == true {
@@ -426,8 +456,51 @@ func (ls *libstore) updateFreq(key string) {
 	// Decrement frequency
 	ls.freqLock.Lock()
 	ls.freqCounter[key]--
-	ls.freqLock.Unlock()
+	if ls.freqCounter[key] == 0 {
+		delete(ls.freqCounter, key)
+	}
+	ls.freqLock.Unlock()*/
 
+}
+
+// Manage frequency counts
+func (ls *libstore) freqManager() {
+	// Initialize variables that don't need to be global here
+	ticker := time.Tick(1 * time.Second)   // Ticks once a second
+	col := 0                               // Tells us what column we're on
+	freqMap := make(map[string]([]uint32)) // key -> array of hits per second
+
+	for {
+		select {
+		case <-ticker: // Clear old freqs once a second
+			// Update the column
+			col := (col + 1) % storagerpc.QueryCacheSeconds
+			// Wipe all the counts from QueryCacheSeconds seconds ago
+			for key, _ := range freqMap {
+				freqMap[key][col] = 0
+			}
+		case key := <-ls.freqAdd: // UPDATE FREQUENCY OF KEY
+			_, ok := freqMap[key]
+			if ok == true {
+				freqMap[key][col] += 1
+			} else {
+				freqMap[key] = make([]uint32, storagerpc.QueryCacheSeconds)
+				freqMap[key][col] = 1
+			}
+		case req := <-ls.freqCheck: //
+			counts, ok := freqMap[req.key]
+			if ok == false { // Nothing stored
+				req.resp <- 0
+			} else {
+				// Iterate over all counts in last QueryCacheSeconds secs
+				var total uint32 = 0
+				for _, count := range counts {
+					total += count
+				}
+				req.resp <- total
+			}
+		}
+	}
 }
 
 //
@@ -463,15 +536,22 @@ func (ls *libstore) getClientForKey(key string) (*rpc.Client, error) {
 
 // Determine whether or not we want a lease on a specified key
 func (ls *libstore) wantLease(key string) bool {
-	// TODO: Implement this
-	if ls.mode == Never { // Never request lease
+	switch ls.mode {
+	case Never:
 		return false
-	} else if ls.mode == Always { // Always request lease
+	case Always:
 		return true
-	} else { // Eh, it depends, see if curent freq is above threshold
-		ls.freqLock.Lock()
-		result := ls.freqCounter[key] > storagerpc.QueryCacheThresh
-		ls.freqLock.Unlock()
-		return result
+	case Normal:
+		resp := make(chan uint32, 1) // Handoff, to keep things running
+		req := &freqReq{
+			key:  key,
+			resp: resp,
+		}
+		ls.freqCheck <- req
+		count := <-resp
+		// _DEBUGLOG.Println("Frequency: ", count)
+		return count > storagerpc.QueryCacheThresh
+	default:
+		return false
 	}
 }
